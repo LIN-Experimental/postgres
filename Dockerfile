@@ -68,12 +68,35 @@ RUN find /usr/local/pgsql/bin /usr/local/pgsql/lib -type f \
 		-exec strip --strip-unneeded {} + || true
 
 ###############################################################################
+# pgvector
+###############################################################################
+FROM build AS pgvector
+
+ARG PGVECTOR_VERSION=v0.8.6
+
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends ca-certificates git \
+	&& rm -rf /var/lib/apt/lists/*
+
+WORKDIR /usr/src
+RUN git clone --branch "$PGVECTOR_VERSION" --depth 1 \
+		https://github.com/pgvector/pgvector.git
+
+# OPTFLAGS="" drops pgvector's default -march=native.  The image has to run on
+# machines other than the one that built it, and a native build would die with
+# SIGILL the moment it met an older CPU.
+RUN cd pgvector \
+	&& make OPTFLAGS="" PG_CONFIG=/usr/local/pgsql/bin/pg_config \
+	&& make OPTFLAGS="" PG_CONFIG=/usr/local/pgsql/bin/pg_config install \
+	&& strip --strip-unneeded /usr/local/pgsql/lib/vector.so
+
+###############################################################################
 # Runtime stage
 ###############################################################################
 FROM debian:bookworm-slim
 
 LABEL org.opencontainers.image.title="linplatform/postgres" \
-	  org.opencontainers.image.description="PostgreSQL with the LIN REST authentication method"
+	  org.opencontainers.image.description="PostgreSQL with the LIN REST authentication method and pgvector"
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -95,7 +118,8 @@ ENV LANG=en_US.utf8
 ENV PATH=/usr/local/pgsql/bin:$PATH
 ENV PGDATA=/var/lib/postgresql/data
 
-COPY --from=build /usr/local/pgsql /usr/local/pgsql
+# From the pgvector stage, which builds on top of the PostgreSQL install.
+COPY --from=pgvector /usr/local/pgsql /usr/local/pgsql
 
 RUN echo /usr/local/pgsql/lib > /etc/ld.so.conf.d/pgsql.conf \
 	&& ldconfig \
