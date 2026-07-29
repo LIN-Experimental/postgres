@@ -1550,7 +1550,11 @@ LDAP
 LDAPMessage
 LDAPURLDesc
 LDAP_TIMEVAL
+LINConfig
 LINE
+LINField
+LINResponse
+LINResponseParse
 LLVMAttributeRef
 LLVMBasicBlockRef
 LLVMBuilderRef

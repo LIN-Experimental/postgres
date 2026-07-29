@@ -946,6 +946,18 @@ InitPostgres(const char *in_dbname, Oid dboid,
 		/* normal multiuser case */
 		Assert(MyProcPort != NULL);
 		PerformAuthentication(MyProcPort);
+
+		/*
+		 * An authentication method may have decided that this connection
+		 * should assume a different role than the one the client asked for,
+		 * in which case our caller's copy of the name is stale.
+		 */
+		if (MyProcPort->mapped_role != NULL)
+		{
+			username = MyProcPort->mapped_role;
+			useroid = InvalidOid;
+		}
+
 		InitializeSessionUserId(username, useroid, false);
 		/* ensure that auth_method is actually valid, aka authn_id is not NULL */
 		if (MyClientConnectionInfo.authn_id)

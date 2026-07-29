@@ -53,9 +53,11 @@
 # directly connected to.
 #
 # METHOD can be "trust", "reject", "md5", "password", "scram-sha-256",
-# "gss", "sspi", "ident", "peer", "pam", "oauth", "ldap" or "cert".
+# "gss", "sspi", "ident", "peer", "pam", "oauth", "ldap", "lin" or "cert".
 # Note that "password" sends passwords in clear text; "md5" or
 # "scram-sha-256" are preferred since they send encrypted passwords.
+# "lin" also receives the password in clear text, so it should only be
+# used on SSL connections.
 #
 # OPTIONS are a set of options for the authentication in the format
 # NAME=VALUE.  The available options depend on the different

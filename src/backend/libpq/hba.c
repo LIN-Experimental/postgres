@@ -32,6 +32,7 @@
 #include "libpq/hba.h"
 #include "libpq/ifaddr.h"
 #include "libpq/libpq-be.h"
+#include "libpq/lin.h"
 #include "libpq/oauth.h"
 #include "postmaster/postmaster.h"
 #include "regex/regex.h"
@@ -116,6 +117,7 @@ static const char *const UserAuthName[] =
 	"cert",
 	"peer",
 	"oauth",
+	"lin",
 };
 
 /*
@@ -1745,6 +1747,12 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 #endif
 	else if (strcmp(token->string, "oauth") == 0)
 		parsedline->auth_method = uaOAuth;
+	else if (strcmp(token->string, "lin") == 0)
+#ifdef USE_LIN_AUTH
+		parsedline->auth_method = uaLIN;
+#else
+		unsupauth = "lin";
+#endif
 	else
 	{
 		ereport(elevel,
@@ -2948,4 +2956,28 @@ const char *
 hba_authname(UserAuth auth_method)
 {
 	return UserAuthName[auth_method];
+}
+
+
+/*
+ * Does any entry of the currently loaded pg_hba.conf use the given
+ * authentication method?
+ *
+ * This lets a method validate its own configuration at server startup, but
+ * only when it could actually be used.
+ */
+bool
+hba_uses_auth_method(UserAuth auth_method)
+{
+	ListCell   *line;
+
+	foreach(line, parsed_hba_lines)
+	{
+		HbaLine    *hba = (HbaLine *) lfirst(line);
+
+		if (hba->auth_method == auth_method)
+			return true;
+	}
+
+	return false;
 }

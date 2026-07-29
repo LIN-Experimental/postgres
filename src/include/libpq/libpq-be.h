@@ -165,6 +165,16 @@ typedef struct Port
 	HbaLine    *hba;
 
 	/*
+	 * Role the authentication method decided this connection should assume,
+	 * instead of the one named in the startup packet, or NULL to use
+	 * user_name as usual.  Only the "lin" method sets this, from the role its
+	 * REST API returns; see CheckLINAuth().  user_name is deliberately left
+	 * alone so that log messages and the authenticated identity keep naming
+	 * the end user rather than the role they were mapped onto.
+	 */
+	char	   *mapped_role;
+
+	/*
 	 * TCP keepalive and user timeout settings.
 	 *
 	 * default values are 0 if AF_UNIX or not yet known; current values are 0

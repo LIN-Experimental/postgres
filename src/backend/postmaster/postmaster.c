@@ -95,7 +95,9 @@
 #include "common/file_perm.h"
 #include "common/pg_prng.h"
 #include "lib/ilist.h"
+#include "libpq/hba.h"
 #include "libpq/libpq.h"
+#include "libpq/lin.h"
 #include "libpq/pqsignal.h"
 #include "pgstat.h"
 #include "port/pg_bswap.h"
@@ -1359,6 +1361,19 @@ PostmasterMain(int argc, char *argv[])
 		 * to the log.
 		 */
 	}
+
+#ifdef USE_LIN_AUTH
+
+	/*
+	 * The LIN method is configured entirely through the environment, which can
+	 * only be set before the server starts.  Read it here, once, so that a
+	 * missing or bogus setting is reported at startup rather than on every
+	 * connection attempt; backends inherit the result.  There is nothing to
+	 * check unless pg_hba.conf actually uses the method.
+	 */
+	if (hba_uses_auth_method(uaLIN))
+		InitializeLINConfig();
+#endif
 
 #ifdef HAVE_PTHREAD_IS_THREADED_NP
 

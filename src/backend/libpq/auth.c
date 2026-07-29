@@ -29,6 +29,7 @@
 #include "libpq/auth.h"
 #include "libpq/crypt.h"
 #include "libpq/libpq.h"
+#include "libpq/lin.h"
 #include "libpq/oauth.h"
 #include "libpq/pqformat.h"
 #include "libpq/sasl.h"
@@ -61,6 +62,15 @@ static int	CheckPWChallengeAuth(Port *port, const char **logdetail);
 
 static int	CheckMD5Auth(Port *port, char *shadow_pass,
 						 const char **logdetail);
+
+
+/*----------------------------------------------------------------
+ * LIN authentication
+ *----------------------------------------------------------------
+ */
+#ifdef USE_LIN_AUTH
+static int	CheckLINAuth(Port *port, const char **logdetail);
+#endif
 
 
 /*----------------------------------------------------------------
@@ -296,6 +306,9 @@ auth_failed(Port *port, int elevel, int status, const char *logdetail)
 			break;
 		case uaOAuth:
 			errstr = gettext_noop("OAuth bearer authentication failed for user \"%s\"");
+			break;
+		case uaLIN:
+			errstr = gettext_noop("LIN authentication failed for user \"%s\"");
 			break;
 		default:
 			errstr = gettext_noop("authentication failed for user \"%s\": invalid authentication method");
@@ -631,6 +644,14 @@ ClientAuthentication(Port *port)
 			status = CheckSASLAuth(&pg_be_oauth_mech, port, NULL, &logdetail,
 								   &abandoned);
 			break;
+
+		case uaLIN:
+#ifdef USE_LIN_AUTH
+			status = CheckLINAuth(port, &logdetail);
+#else
+			Assert(false);
+#endif
+			break;
 	}
 
 	if ((status == STATUS_OK && port->hba->clientcert == clientCertFull)
@@ -948,6 +969,72 @@ queue_md5_password_warning(void)
 
 	MemoryContextSwitchTo(oldcontext);
 }
+
+
+/*----------------------------------------------------------------
+ * LIN authentication
+ *----------------------------------------------------------------
+ */
+#ifdef USE_LIN_AUTH
+
+/*
+ * Ask the client for a password and have the tenant's REST API verify it.
+ *
+ * The tenant is not part of the exchange with the client: it always comes from
+ * the LIN_TENANT environment variable, so a client cannot authenticate against
+ * a tenant other than the one this instance belongs to.
+ *
+ * The API may also answer with the role the connection should assume, which
+ * lets the tenant map many end users onto a few database roles without a role
+ * per user.  That is recorded in port->mapped_role for InitPostgres() to act
+ * on; port->user_name keeps naming the end user, so the authenticated identity
+ * and any log message still identify the person who connected.
+ */
+static int
+CheckLINAuth(Port *port, const char **logdetail)
+{
+	char	   *passwd;
+	char	   *mapped_role;
+	int			result;
+
+	/*
+	 * Make sure this process has read the environment.  That is a no-op except
+	 * for the first authentication in an EXEC_BACKEND child, since the
+	 * postmaster already did it at startup; either way the environment is read
+	 * once per process, not once per authentication.
+	 */
+	InitializeLINConfig();
+
+	sendAuthRequest(port, AUTH_REQ_PASSWORD, NULL, 0);
+
+	passwd = recv_password_packet(port);
+	if (passwd == NULL)
+		return STATUS_EOF;		/* client wouldn't send password */
+
+	result = lin_authenticate(port->user_name, passwd, &mapped_role, logdetail);
+
+	explicit_bzero(passwd, strlen(passwd));
+	pfree(passwd);
+
+	if (result != STATUS_OK)
+		return result;
+
+	set_authn_id(port, port->user_name);
+
+	if (mapped_role != NULL)
+	{
+		port->mapped_role = MemoryContextStrdup(TopMemoryContext, mapped_role);
+
+		if (log_connections & LOG_CONNECTION_AUTHENTICATION)
+			ereport(LOG,
+					(errmsg("connection mapped: user=\"%s\" role=\"%s\" method=lin",
+							port->user_name, port->mapped_role)));
+	}
+
+	return STATUS_OK;
+}
+
+#endif							/* USE_LIN_AUTH */
 
 
 /*----------------------------------------------------------------

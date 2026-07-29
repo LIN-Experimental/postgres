@@ -78,6 +78,7 @@
 #include "common/username.h"
 #include "fe_utils/option_utils.h"
 #include "fe_utils/string_utils.h"
+#include "libpq/lin.h"			/* for USE_LIN_AUTH */
 #include "getopt_long.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
@@ -113,6 +114,9 @@ static const char *const auth_methods_host[] = {
 #ifdef USE_SSL
 	"cert",
 #endif
+#ifdef USE_LIN_AUTH
+	"lin",
+#endif
 	NULL
 };
 static const char *const auth_methods_local[] = {
@@ -125,6 +129,9 @@ static const char *const auth_methods_local[] = {
 #endif
 #ifdef USE_LDAP
 	"ldap",
+#endif
+#ifdef USE_LIN_AUTH
+	"lin",
 #endif
 	NULL
 };

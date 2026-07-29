@@ -39,7 +39,8 @@ typedef enum UserAuth
 	uaCert,
 	uaPeer,
 	uaOAuth,
-#define USER_AUTH_LAST uaOAuth	/* Must be last value of this enum */
+	uaLIN,
+#define USER_AUTH_LAST uaLIN	/* Must be last value of this enum */
 } UserAuth;
 
 /*
@@ -189,6 +190,7 @@ typedef struct Port Port;
 extern bool load_hba(void);
 extern bool load_ident(void);
 extern const char *hba_authname(UserAuth auth_method);
+extern bool hba_uses_auth_method(UserAuth auth_method);
 extern void hba_getauthmethod(Port *port);
 extern int	check_usermap(const char *usermap_name,
 						  const char *pg_user, const char *system_user,

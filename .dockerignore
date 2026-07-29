@@ -1,0 +1,24 @@
+# The git history is by far the largest thing in the tree and the build does
+# not need it.
+.git
+.gitattributes
+.gitignore
+
+# Leftovers from an in-tree build on the host.
+**/*.o
+**/*.a
+**/*.so
+**/*.so.*
+**/*.dylib
+**/*.dll
+**/*.exe
+src/Makefile.global
+src/include/pg_config.h
+src/include/pg_config_ext.h
+src/include/pg_config_os.h
+src/backend/postgres
+tmp_install
+build
+build-*
+doc/src/sgml/html
+doc/src/sgml/man?

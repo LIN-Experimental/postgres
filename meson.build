@@ -1064,6 +1064,11 @@ if not libcurlopt.disabled()
 *** to use it with libpq.''')
       endif
     endif
+
+    # The backend's LIN authentication method needs nothing from libcurl
+    # beyond a working easy handle, so it is available wherever libcurl is,
+    # unlike the client-side OAuth flow gated by USE_LIBCURL below.
+    cdata.set('USE_LIN_AUTH', 1)
   endif
 
   # Check that the current platform supports our builtin flow. This requires
@@ -3662,6 +3667,10 @@ backend_both_deps += [
   zlib,
   zstd,
 ]
+
+# libcurl is only used by the backend's LIN authentication method, so it stays
+# out of backend_both_deps and extension modules don't have to link it.
+backend_deps += libcurl
 
 backend_mod_deps = backend_both_deps + os_deps
 

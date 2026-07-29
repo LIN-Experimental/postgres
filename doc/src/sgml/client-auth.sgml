@@ -1143,6 +1143,12 @@ omicron         bryanh                  guest1
       which relies on an external OAuth 2.0 identity provider.
      </para>
     </listitem>
+    <listitem>
+     <para>
+      <link linkend="auth-lin">LIN authentication</link>, which verifies
+      passwords by calling a tenant-specific REST API.
+     </para>
+    </listitem>
    </itemizedlist>
   </para>
 
@@ -2490,6 +2496,200 @@ CONTEXT:  line 2 of configuration file "data/pg_hba.conf"
      </varlistentry>
     </variablelist>
    </para>
+  </sect1>
+
+  <sect1 id="auth-lin">
+   <title>LIN Authentication</title>
+
+   <indexterm zone="auth-lin">
+    <primary>LIN</primary>
+   </indexterm>
+
+   <para>
+    This authentication method operates similarly to
+    <literal>password</literal>, except that the password is verified by an
+    external <acronym>REST</acronym> service instead of by the server itself.
+    The service is expected to belong to the <firstterm>tenant</firstterm> that
+    owns this instance.  As with the other password-based methods that delegate
+    verification, the user's role must already exist in the database.
+   </para>
+
+   <para>
+    This method is only available if
+    <productname>PostgreSQL</productname> was built with
+    <application>libcurl</application> support
+    (<option>--with-libcurl</option>).
+   </para>
+
+   <sect2 id="auth-lin-config">
+    <title>Configuration</title>
+
+    <para>
+     Unlike the other authentication methods, <literal>lin</literal> is not
+     configured through options in <filename>pg_hba.conf</filename> but through
+     environment variables, so that it can be set up with nothing more than the
+     facilities offered by <productname>Docker</productname>,
+     <productname>Kubernetes</productname>, or any other platform able to inject
+     environment variables into the server process.
+    </para>
+
+    <variablelist>
+     <varlistentry>
+      <term><envar>LIN_TENANT</envar> (required)</term>
+      <listitem>
+       <para>
+        The tenant that owns this instance, for example
+        <literal>empresa-001</literal>.  This value, and never anything sent by
+        the client, is what identifies the tenant to the authentication API.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><envar>LIN_AUTH_ENDPOINT</envar> (required)</term>
+      <listitem>
+       <para>
+        The <acronym>URL</acronym> of the login <acronym>API</acronym>, for
+        example
+        <literal>https://auth.miempresa.com/api/auth/login</literal>.  Only
+        <literal>http</literal> and <literal>https</literal> URLs are accepted,
+        and redirects are not followed, so that a password is never handed to a
+        host other than the configured one.  An <literal>https</literal>
+        endpoint should be used in production, since the password travels to the
+        service in the request body.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><envar>LIN_HTTP_TIMEOUT</envar> (optional)</term>
+      <listitem>
+       <para>
+        How long to wait for the <acronym>API</acronym>, in milliseconds.  It
+        must be a positive integer, and defaults to <literal>5000</literal>.
+       </para>
+      </listitem>
+     </varlistentry>
+    </variablelist>
+
+    <para>
+     These variables are read once, while the server starts, and the values are
+     then kept in memory for the whole life of the process; they are not read
+     again for each authentication attempt.  Changing them therefore requires
+     restarting the server, not just reloading the configuration files.
+    </para>
+
+    <para>
+     If <filename>pg_hba.conf</filename> contains an entry using the
+     <literal>lin</literal> method and either <envar>LIN_TENANT</envar> or
+     <envar>LIN_AUTH_ENDPOINT</envar> is unset, the server logs the problem and
+     refuses to start, since no such connection attempt could ever succeed.
+    </para>
+   </sect2>
+
+   <sect2 id="auth-lin-protocol">
+    <title>API Contract</title>
+
+    <para>
+     To authenticate a user, the server asks the client for a password in clear
+     text (so this method should only be used on <acronym>SSL</acronym>
+     connections) and then issues a <literal>POST</literal> request to
+     <envar>LIN_AUTH_ENDPOINT</envar> with a
+     <literal>application/json</literal> body of the form:
+<programlisting>
+{
+    "tenant": "empresa-001",
+    "username": "alex",
+    "password": "..."
+}
+</programlisting>
+     where <structfield>tenant</structfield> is the value of
+     <envar>LIN_TENANT</envar>, <structfield>username</structfield> is the
+     database user name the client is trying to connect as, and
+     <structfield>password</structfield> is the password the client supplied.
+    </para>
+
+    <para>
+     A response outside the <literal>2xx</literal> range, as well as a failure
+     to reach the service within <envar>LIN_HTTP_TIMEOUT</envar>, makes
+     authentication fail; the status code and the beginning of the response body
+     are written to the server log to help with diagnosis.
+    </para>
+
+    <para>
+     A <literal>2xx</literal> status is not on its own enough.  If the body has
+     a top-level field named <structfield>authenticated</structfield>, it has the
+     last word:
+<programlisting>
+{
+    "authenticated": true
+}
+</programlisting>
+     Authentication fails unless that field is the boolean
+     <literal>true</literal>.  A service that reports a rejection with
+     <literal>{"authenticated": false}</literal> and HTTP 200 — which is a
+     common enough API style — is therefore honored rather than mistaken for a
+     success.  Anything that is not a boolean, including
+     <literal>null</literal> or the string <literal>"true"</literal>, is treated
+     as a failure rather than interpreted.
+    </para>
+
+    <para>
+     If the field is absent, the <literal>2xx</literal> status is taken as the
+     answer, so an endpoint that signals rejection purely through its status code
+     needs no body at all.
+    </para>
+   </sect2>
+
+   <sect2 id="auth-lin-role-mapping">
+    <title>Role Mapping</title>
+
+    <para>
+     By default the client connects as the role it named in its startup packet,
+     which must exist in the database, exactly as with
+     <link linkend="auth-ldap">LDAP</link> or <link linkend="auth-pam">PAM</link>.
+     A successful response may instead name the role the connection should
+     assume, in a top-level string field called <structfield>role</structfield>:
+<programlisting>
+{
+    "authenticated": true,
+    "role": "app_reader"
+}
+</programlisting>
+     This lets a tenant map many end users onto a handful of database roles,
+     so that a role per user does not have to be maintained.  The named role
+     must still exist; it is not created on demand.
+    </para>
+
+    <para>
+     The end user's own name is what remains recorded as the authenticated
+     identity, so <function>system_user</function> reports
+     <literal>lin:<replaceable>username</replaceable></literal>
+     while <function>current_user</function> reports the mapped role.  Auditing
+     therefore still identifies the person who connected, and the distinction is
+     available to triggers and row-level security policies.
+    </para>
+
+    <para>
+     If the field is absent or null, the client keeps the role it asked for.
+     Anything else is treated as an authentication failure rather than guessed
+     at, since the alternative would be to connect as the wrong role: a
+     <structfield>role</structfield> that is not a string, an empty name, or a
+     name that does not fit in <symbol>NAMEDATALEN</symbol>.  The same applies to
+     a response that cannot be read at all, whether because it is not valid
+     <acronym>JSON</acronym> or because it exceeds 8 kB.
+    </para>
+
+    <warning>
+     <para>
+      A response can name <emphasis>any</emphasis> role, including a superuser.
+      The authentication service is fully trusted to decide who becomes what, so
+      it should be treated as part of the database's security perimeter: reach
+      it over <literal>https</literal> and keep the set of roles it is able to
+      name under review.
+     </para>
+    </warning>
+   </sect2>
   </sect1>
 
   <sect1 id="client-authentication-problems">

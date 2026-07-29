@@ -34,6 +34,12 @@ ifeq ($(with_ssl),openssl)
 OBJS += be-secure-openssl.o
 endif
 
+# The LIN authentication method needs libcurl to reach its REST API
+ifeq ($(with_libcurl),yes)
+OBJS += auth-lin.o
+override CPPFLAGS += $(LIBCURL_CPPFLAGS)
+endif
+
 ifeq ($(with_gssapi),yes)
 OBJS += be-gssapi-common.o be-secure-gssapi.o
 endif

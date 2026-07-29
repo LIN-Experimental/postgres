@@ -21,6 +21,11 @@ if ssl.found()
   backend_sources += files('be-secure-openssl.c')
 endif
 
+# The LIN authentication method needs libcurl to reach its REST API
+if libcurl.found()
+  backend_sources += files('auth-lin.c')
+endif
+
 if gssapi.found()
   backend_sources += files(
     'be-secure-gssapi.c',

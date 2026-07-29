@@ -77,6 +77,13 @@ ifeq ($(with_systemd),yes)
 LIBS += -lsystemd
 endif
 
+# libcurl is needed by the LIN authentication method (auth-lin.c).  Its flags
+# are kept out of the global ones, so add them back here.
+ifeq ($(with_libcurl),yes)
+override LDFLAGS := $(LDFLAGS) $(LIBCURL_LDFLAGS)
+LIBS += $(LIBCURL_LDLIBS)
+endif
+
 override LDFLAGS := $(LDFLAGS) $(LDFLAGS_EX) $(LDFLAGS_EX_BE)
 
 ##########################################################################
