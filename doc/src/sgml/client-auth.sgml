@@ -2570,6 +2570,19 @@ CONTEXT:  line 2 of configuration file "data/pg_hba.conf"
        </para>
       </listitem>
      </varlistentry>
+
+     <varlistentry>
+      <term><envar>LIN_CACHE_TTL</envar> (optional)</term>
+      <listitem>
+       <para>
+        How long an acceptance may be reused, in <emphasis>seconds</emphasis>.
+        It defaults to <literal>20</literal>; <literal>0</literal> disables the
+        cache, and values above <literal>300</literal> are rejected at startup so
+        that milliseconds written by mistake do not become hours of cached
+        credentials.  See <xref linkend="auth-lin-cache"/>.
+       </para>
+      </listitem>
+     </varlistentry>
     </variablelist>
 
     <para>
@@ -2639,6 +2652,50 @@ CONTEXT:  line 2 of configuration file "data/pg_hba.conf"
      answer, so an endpoint that signals rejection purely through its status code
      needs no body at all.
     </para>
+   </sect2>
+
+   <sect2 id="auth-lin-cache">
+    <title>Caching</title>
+
+    <para>
+     Without a connection pooler, every connection attempt costs one
+     <acronym>HTTP</acronym> round trip before the client can do anything.  To
+     keep that from dominating connection latency, an acceptance is remembered in
+     shared memory for <envar>LIN_CACHE_TTL</envar> seconds and reused by every
+     backend, so a burst of connections from one user costs a single request.
+     The cache also lets connections keep succeeding through a brief outage of
+     the authentication service.
+    </para>
+
+    <para>
+     Only acceptances are cached.  A rejected credential is checked again every
+     time, so brute-force attempts always reach the service, and a user who has
+     just corrected their password is not locked out for the rest of the interval.
+     The role the <acronym>API</acronym> named is cached alongside, so a reused
+     answer maps the connection exactly as the original one did.
+    </para>
+
+    <para>
+     Entries are keyed by an <acronym>HMAC</acronym>-<acronym>SHA256</acronym> of
+     the tenant, user name and password, under a key generated randomly at server
+     startup.  The cache therefore never holds a password, and its contents mean
+     nothing outside the lifetime of the cluster that produced them.  The cache
+     is a fixed set of slots; a collision evicts the previous occupant, so an
+     entry may be dropped before it expires, but a lookup cannot return another
+     user's answer.
+    </para>
+
+    <warning>
+     <para>
+      Caching trades revocation latency for connection latency.  For up to
+      <envar>LIN_CACHE_TTL</envar> seconds, a credential that the
+      <acronym>API</acronym> has already accepted continues to work even if it has
+      since been disabled, and a role mapping continues to apply even if it has
+      since been changed.  If a deployment cannot accept that window, set
+      <envar>LIN_CACHE_TTL</envar> to <literal>0</literal>; every connection then
+      asks the service again.
+     </para>
+    </warning>
    </sect2>
 
    <sect2 id="auth-lin-role-mapping">

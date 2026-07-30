@@ -176,14 +176,40 @@ docker run -d --name pg -p 5432:5432 \
 | `LIN_TENANT` | sí | Tenant dueño de esta instancia. **Nunca** viene del cliente. |
 | `LIN_AUTH_ENDPOINT` | sí | URL de la API de login. Solo `http` y `https`; no se siguen redirecciones. |
 | `LIN_HTTP_TIMEOUT` | no | Espera máxima en milisegundos. Por defecto `5000`. |
+| `LIN_CACHE_TTL` | no | **Segundos** que se reutiliza una autenticación aceptada. Por defecto `20`; `0` la desactiva; máximo `300`. |
 | `POSTGRES_USER` | no | Superusuario a crear. Por defecto `postgres`. |
 | `POSTGRES_PASSWORD` | no | Contraseña del superusuario, si no usas LIN. |
 | `POSTGRES_HOST_AUTH_METHOD` | no | Método para conexiones host cuando LIN no está configurado. |
 | `PGDATA` | no | Por defecto `/var/lib/postgresql/data`. |
 
-Las tres primeras **se leen una sola vez, al arrancar el servidor**, y los
+Las cuatro primeras **se leen una sola vez, al arrancar el servidor**, y los
 valores se reutilizan durante toda la vida del proceso. Cambiarlas exige
 reiniciar, no basta con recargar la configuración.
+
+### Caché de autenticación
+
+Sin un pooler, cada conexión paga un viaje HTTP completo antes de poder hacer
+nada. Por eso una autenticación **aceptada** se guarda en memoria compartida
+durante `LIN_CACHE_TTL` segundos y la reutilizan todos los backends: una ráfaga
+de conexiones del mismo usuario cuesta una sola petición. También permite que
+las conexiones sigan funcionando durante una caída breve de la API.
+
+Solo se cachean las aceptaciones. Un rechazo se vuelve a consultar siempre, así
+que los intentos de fuerza bruta siempre llegan al servicio y un usuario que
+acaba de corregir su contraseña entra de inmediato. El rol devuelto por la API
+se guarda junto a la entrada, así que una respuesta reutilizada mapea igual que
+la original.
+
+Las entradas se indexan por un HMAC-SHA256 del tenant, el usuario y la
+contraseña, bajo una clave generada aleatoriamente al arrancar. **La caché nunca
+guarda la contraseña**, y su contenido no significa nada fuera de la vida del
+cluster que lo produjo.
+
+> **El coste es latencia de revocación.** Durante hasta `LIN_CACHE_TTL`
+> segundos, una credencial que la API ya aceptó sigue funcionando aunque la
+> hayas deshabilitado, y un mapeo de rol sigue aplicándose aunque lo hayas
+> cambiado. Si tu despliegue no puede aceptar esa ventana, pon
+> `LIN_CACHE_TTL=0`.
 
 Si `pg_hba.conf` usa `lin` y falta `LIN_TENANT` o `LIN_AUTH_ENDPOINT`, el
 servidor **registra el error y no arranca**, en lugar de fallar en cada
@@ -485,6 +511,7 @@ docker run -d --name lin-mock --network linnet -e SRC="$B64" python:3.12-alpine 
 | `environment variable "LIN_TENANT" is not set` | Define `LIN_TENANT`. El servidor no arranca porque `pg_hba.conf` usa `lin`. |
 | `environment variable "LIN_AUTH_ENDPOINT" is not set` | Define `LIN_AUTH_ENDPOINT`. |
 | `invalid value for environment variable "LIN_HTTP_TIMEOUT"` | Tiene que ser un entero positivo de milisegundos. |
+| `invalid value for environment variable "LIN_CACHE_TTL"` | Segundos entre 0 y 300. Si pusiste `20000` pensando en milisegundos, es esto. |
 
 ### Al conectar
 

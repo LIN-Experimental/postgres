@@ -12,6 +12,14 @@
  *	LIN_AUTH_ENDPOINT	URL of the login API (required)
  *	LIN_HTTP_TIMEOUT	request timeout in milliseconds (optional, default
  *						LIN_DEFAULT_TIMEOUT_MS)
+ *	LIN_CACHE_TTL		how long an acceptance may be reused, in seconds
+ *						(optional, default LIN_DEFAULT_CACHE_TTL, 0 disables)
+ *
+ * Accepted credentials are cached in shared memory for LIN_CACHE_TTL seconds,
+ * so that a burst of connections from the same user costs one HTTP round trip
+ * rather than one per connection.  The cost is revocation latency: a credential
+ * the API has already accepted keeps working for up to that long after being
+ * revoked.  Rejections are never cached.
  *
  * The environment is read exactly once per process by InitializeLINConfig(),
  * never once per authentication attempt.  The postmaster calls it during
@@ -33,12 +41,17 @@
 
 #include <curl/curl.h>
 
+#include "common/hmac.h"
 #include "common/jsonapi.h"
+#include "common/sha2.h"
 #include "lib/stringinfo.h"
 #include "libpq/lin.h"
 #include "mb/pg_wchar.h"
+#include "storage/lwlock.h"
+#include "storage/shmem.h"
 #include "utils/json.h"
 #include "utils/memutils.h"
+#include "utils/timestamp.h"
 
 /*
  * Configuration read from the environment, valid for the whole life of the
@@ -49,6 +62,7 @@ typedef struct LINConfig
 	char	   *tenant;
 	char	   *endpoint;
 	long		timeout_ms;
+	int			cache_ttl;		/* seconds; 0 disables the cache */
 } LINConfig;
 
 static LINConfig lin_config;
@@ -89,14 +103,210 @@ typedef struct LINResponseParse
 	bool		role_bad_type;	/* the role field was not a string */
 } LINResponseParse;
 
+/*
+ * One cached answer from the API.
+ *
+ * The credentials are represented only by an HMAC of them, so that a lookup can
+ * tell "same user, same password" without the cache holding the password.  The
+ * mapped role has to be cached alongside, or a hit would lose the mapping.
+ */
+typedef struct LINCacheEntry
+{
+	uint8		digest[PG_SHA256_DIGEST_LENGTH];
+	TimestampTz expires;		/* 0 when the slot is unused */
+	char		role[NAMEDATALEN];	/* empty string when the API named none */
+} LINCacheEntry;
+
+/*
+ * The cache itself.  A fixed array of slots addressed by the digest, so a
+ * collision simply evicts the previous occupant: entries may be dropped early,
+ * but a lookup can never return somebody else's answer.
+ *
+ * hmac_key is generated once at postmaster startup and shared by every backend.
+ * It keeps the digests specific to this cluster's lifetime, so they are not
+ * precomputable.
+ */
+typedef struct LINCacheShared
+{
+	uint8		hmac_key[PG_SHA256_DIGEST_LENGTH];
+	LINCacheEntry entries[LIN_CACHE_SLOTS];
+} LINCacheShared;
+
+static LINCacheShared *lin_cache = NULL;
+
 static void lin_curl_init(void);
 static size_t lin_response_callback(char *contents, size_t size, size_t nmemb,
 									void *userdata);
+static bool lin_cache_digest(const char *username, const char *password,
+							 uint8 *digest);
+static bool lin_cache_lookup(const char *username, const char *password,
+							 char **role);
+static void lin_cache_store(const char *username, const char *password,
+							const char *role);
 static void lin_build_request_body(StringInfo body, const char *username,
 								   const char *password);
 static int	lin_check_response(const LINResponse *response, char **role,
 							   const char **logdetail);
 
+
+/*
+ * Shared memory setup for the cache.
+ *
+ * The area is reserved unconditionally, because pg_hba.conf can start using the
+ * "lin" method on a reload, long after shared memory has been sized.  It is
+ * small enough that this costs nothing worth measuring.
+ */
+static void
+LINAuthCacheShmemRequest(void *arg)
+{
+	ShmemRequestStruct(.name = "LIN authentication cache",
+					   .size = sizeof(LINCacheShared),
+					   .ptr = (void **) &lin_cache);
+}
+
+static void
+LINAuthCacheShmemInit(void *arg)
+{
+	memset(lin_cache, 0, sizeof(LINCacheShared));
+
+	if (!pg_strong_random(lin_cache->hmac_key, sizeof(lin_cache->hmac_key)))
+		ereport(FATAL,
+				(errmsg("could not generate a key for the LIN authentication cache")));
+}
+
+const ShmemCallbacks LINAuthCacheShmemCallbacks = {
+	.request_fn = LINAuthCacheShmemRequest,
+	.init_fn = LINAuthCacheShmemInit,
+};
+
+/*
+ * Reduce one set of credentials to the digest used as the cache key.
+ *
+ * The tenant is folded in even though it is fixed for the life of the cluster,
+ * so that the digest cannot be meaningful for any other tenant.  The fields are
+ * separated by their NUL terminators, so that no two different triples can
+ * produce the same input.
+ *
+ * Returns false if hashing failed, in which case the caller must fall back to
+ * asking the API.
+ */
+static bool
+lin_cache_digest(const char *username, const char *password, uint8 *digest)
+{
+	pg_hmac_ctx *ctx;
+	bool		ok = false;
+
+	ctx = pg_hmac_create(PG_SHA256);
+	if (ctx == NULL)
+		return false;
+
+	if (pg_hmac_init(ctx, lin_cache->hmac_key, sizeof(lin_cache->hmac_key)) == 0 &&
+		pg_hmac_update(ctx, (const uint8 *) lin_config.tenant,
+					   strlen(lin_config.tenant) + 1) == 0 &&
+		pg_hmac_update(ctx, (const uint8 *) username, strlen(username) + 1) == 0 &&
+		pg_hmac_update(ctx, (const uint8 *) password, strlen(password) + 1) == 0 &&
+		pg_hmac_final(ctx, digest, PG_SHA256_DIGEST_LENGTH) == 0)
+		ok = true;
+
+	pg_hmac_free(ctx);
+
+	return ok;
+}
+
+/*
+ * Which slot a digest belongs in.
+ */
+static inline uint32
+lin_cache_slot(const uint8 *digest)
+{
+	uint32		hash;
+
+	memcpy(&hash, digest, sizeof(hash));
+
+	return hash % LIN_CACHE_SLOTS;
+}
+
+/*
+ * Is there a live answer for these credentials?
+ *
+ * On a hit, *role is set to a palloc'd role name or to NULL if the cached answer
+ * named none, and the caller can skip the API entirely.
+ */
+static bool
+lin_cache_lookup(const char *username, const char *password, char **role)
+{
+	uint8		digest[PG_SHA256_DIGEST_LENGTH];
+	LINCacheEntry *entry;
+	bool		hit = false;
+	char		cached_role[NAMEDATALEN];
+
+	*role = NULL;
+
+	if (lin_config.cache_ttl <= 0 || lin_cache == NULL)
+		return false;
+
+	if (!lin_cache_digest(username, password, digest))
+		return false;
+
+	entry = &lin_cache->entries[lin_cache_slot(digest)];
+
+	LWLockAcquire(LINAuthCacheLock, LW_SHARED);
+
+	if (entry->expires != 0 &&
+		memcmp(entry->digest, digest, PG_SHA256_DIGEST_LENGTH) == 0 &&
+		entry->expires > GetCurrentTimestamp())
+	{
+		hit = true;
+		strlcpy(cached_role, entry->role, sizeof(cached_role));
+	}
+
+	LWLockRelease(LINAuthCacheLock);
+
+	if (hit && cached_role[0] != '\0')
+		*role = pstrdup(cached_role);
+
+	return hit;
+}
+
+/*
+ * Remember an answer the API gave us.  role may be NULL, meaning the API named
+ * no role and the client keeps the one it asked for.
+ */
+static void
+lin_cache_store(const char *username, const char *password, const char *role)
+{
+	uint8		digest[PG_SHA256_DIGEST_LENGTH];
+	LINCacheEntry *entry;
+
+	if (lin_config.cache_ttl <= 0 || lin_cache == NULL)
+		return;
+
+	/*
+	 * A role we could not store in full would come back truncated on a hit, so
+	 * leave the answer uncached instead.  lin_check_response() already rejects
+	 * anything this long, so this is belt and braces.
+	 */
+	if (role != NULL && strlen(role) >= NAMEDATALEN)
+		return;
+
+	if (!lin_cache_digest(username, password, digest))
+		return;
+
+	entry = &lin_cache->entries[lin_cache_slot(digest)];
+
+	LWLockAcquire(LINAuthCacheLock, LW_EXCLUSIVE);
+
+	memcpy(entry->digest, digest, PG_SHA256_DIGEST_LENGTH);
+	if (role != NULL)
+		strlcpy(entry->role, role, sizeof(entry->role));
+	else
+		entry->role[0] = '\0';
+
+	entry->expires = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+												 lin_config.cache_ttl * 1000L);
+
+	LWLockRelease(LINAuthCacheLock);
+}
 
 /*
  * Read the LIN configuration out of the environment.
@@ -112,7 +322,9 @@ InitializeLINConfig(void)
 	const char *tenant;
 	const char *endpoint;
 	const char *timeout;
+	const char *cache_ttl;
 	long		timeout_ms = LIN_DEFAULT_TIMEOUT_MS;
+	long		ttl_seconds = LIN_DEFAULT_CACHE_TTL;
 
 	if (lin_config_initialized)
 		return;
@@ -152,6 +364,24 @@ InitializeLINConfig(void)
 							   LIN_ENV_TIMEOUT)));
 	}
 
+	cache_ttl = getenv(LIN_ENV_CACHE_TTL);
+	if (cache_ttl != NULL && cache_ttl[0] != '\0')
+	{
+		char	   *endptr;
+
+		errno = 0;
+		ttl_seconds = strtol(cache_ttl, &endptr, 10);
+
+		if (errno != 0 || *endptr != '\0' || ttl_seconds < 0 ||
+			ttl_seconds > LIN_MAX_CACHE_TTL)
+			ereport(FATAL,
+					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+					 errmsg("invalid value for environment variable \"%s\": \"%s\"",
+							LIN_ENV_CACHE_TTL, cache_ttl),
+					 errdetail("\"%s\" must be a number of seconds between 0 and %d, where 0 disables the cache.",
+							   LIN_ENV_CACHE_TTL, LIN_MAX_CACHE_TTL)));
+	}
+
 	/*
 	 * Copy the strings into a context that lives as long as the process;
 	 * getenv() results are not guaranteed to stay valid.
@@ -159,13 +389,14 @@ InitializeLINConfig(void)
 	lin_config.tenant = MemoryContextStrdup(TopMemoryContext, tenant);
 	lin_config.endpoint = MemoryContextStrdup(TopMemoryContext, endpoint);
 	lin_config.timeout_ms = timeout_ms;
+	lin_config.cache_ttl = (int) ttl_seconds;
 
 	lin_config_initialized = true;
 
 	ereport(DEBUG1,
-			(errmsg_internal("LIN authentication configured for tenant \"%s\" using endpoint \"%s\" (timeout %ldms)",
+			(errmsg_internal("LIN authentication configured for tenant \"%s\" using endpoint \"%s\" (timeout %ldms, cache %ds)",
 							 lin_config.tenant, lin_config.endpoint,
-							 lin_config.timeout_ms)));
+							 lin_config.timeout_ms, lin_config.cache_ttl)));
 }
 
 /*
@@ -473,6 +704,11 @@ lin_check_response(const LINResponse *response, char **role,
  *
  * *mapped_role is set to the role the API wants this connection to assume, or
  * to NULL if it named none and the client should keep the role it asked for.
+ *
+ * An answer the API gave recently may be reused instead of asking again; see
+ * lin_cache_lookup().  Only acceptances are cached, so a rejected credential is
+ * always re-checked, and a password the user has just corrected works
+ * immediately.
  */
 int
 lin_authenticate(const char *username, const char *password,
@@ -490,6 +726,14 @@ lin_authenticate(const char *username, const char *password,
 	Assert(lin_config_initialized);
 
 	*mapped_role = NULL;
+
+	if (lin_cache_lookup(username, password, mapped_role))
+	{
+		ereport(DEBUG1,
+				(errmsg_internal("LIN authentication served from cache for user \"%s\"",
+								 username)));
+		return STATUS_OK;
+	}
 
 	lin_curl_init();
 
@@ -567,6 +811,10 @@ lin_authenticate(const char *username, const char *password,
 		 * it, and may name a role to assume.
 		 */
 		status = lin_check_response(&response, mapped_role, logdetail);
+
+		/* Only remember answers that let the user in. */
+		if (status == STATUS_OK)
+			lin_cache_store(username, password, *mapped_role);
 	}
 	else
 	{

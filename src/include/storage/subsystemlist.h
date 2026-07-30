@@ -82,6 +82,15 @@ PG_SHMEM_SUBSYSTEM(WaitEventCustomShmemCallbacks)
 #ifdef USE_INJECTION_POINTS
 PG_SHMEM_SUBSYSTEM(InjectionPointShmemCallbacks)
 #endif
+/*
+ * The LIN authentication cache.  This file is included from several places in
+ * an order we don't control, so the condition is spelled out here rather than
+ * relying on USE_LIN_AUTH having been derived already; keep it in sync with
+ * libpq/lin.h.
+ */
+#if defined(HAVE_LIBCURL) || defined(USE_LIN_AUTH)
+PG_SHMEM_SUBSYSTEM(LINAuthCacheShmemCallbacks)
+#endif
 PG_SHMEM_SUBSYSTEM(WaitLSNShmemCallbacks)
 PG_SHMEM_SUBSYSTEM(LogicalDecodingCtlShmemCallbacks)
 PG_SHMEM_SUBSYSTEM(DataChecksumsShmemCallbacks)

@@ -52,6 +52,32 @@
 #define LIN_AUTH_FIELD			"authenticated"
 #define LIN_ROLE_FIELD			"role"
 
+/*
+ * How long a successful answer from the API may be reused, in seconds, and the
+ * environment variable that overrides it.  Zero disables the cache.
+ *
+ * A cache trades revocation latency for connection latency: for up to this
+ * long, a credential the API has already accepted keeps working even if it has
+ * since been revoked.  Keep it short.
+ */
+#define LIN_ENV_CACHE_TTL		"LIN_CACHE_TTL"
+#define LIN_DEFAULT_CACHE_TTL	20
+
+/*
+ * Upper bound on the TTL.  Not a technical limit: it exists so that a typo such
+ * as writing milliseconds where seconds are expected is rejected at startup
+ * instead of silently caching credentials for hours.
+ */
+#define LIN_MAX_CACHE_TTL		300
+
+/* Number of cached answers held in shared memory */
+#define LIN_CACHE_SLOTS			1024
+
+/*
+ * LINAuthCacheShmemCallbacks is declared by storage/subsystems.h, which builds
+ * the extern list out of storage/subsystemlist.h.
+ */
+
 extern void InitializeLINConfig(void);
 extern int	lin_authenticate(const char *username, const char *password,
 							 char **mapped_role, const char **logdetail);

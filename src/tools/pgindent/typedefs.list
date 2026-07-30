@@ -1550,6 +1550,8 @@ LDAP
 LDAPMessage
 LDAPURLDesc
 LDAP_TIMEVAL
+LINCacheEntry
+LINCacheShared
 LINConfig
 LINE
 LINField
