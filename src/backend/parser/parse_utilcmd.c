@@ -1484,6 +1484,16 @@ expandTableLikeClause(RangeVar *heapRel, TableLikeClause *table_like_clause)
 								   ccname,
 								   RelationGetRelationName(relation))));
 
+			/*
+			 * Copying a CHECK constraint adds new references.  Since the
+			 * constraint arrives pre-cooked, it bypasses the checks in
+			 * AddRelationNewConstraints(), so we must check for USAGE on
+			 * types here.
+			 */
+			CheckUsageOnTypesInSingleRelExpr(stringToNode(ccbin),
+											 RelationGetRelid(relation),
+											 GetUserId());
+
 			n = makeNode(Constraint);
 			n->contype = CONSTR_CHECK;
 			n->conname = pstrdup(ccname);
@@ -4117,7 +4127,7 @@ transformAlterTableStmt(Oid relid, AlterTableStmt *stmt,
 					if (list_length(partcmd->partlist) < 2)
 						ereport(ERROR,
 								errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-								errmsg("list of new partitions should contain at least two partitions"));
+								errmsg("list of new partitions must contain at least two partitions"));
 
 					transformPartitionCmdForSplit(&cxt, partcmd);
 					newcmds = lappend(newcmds, cmd);

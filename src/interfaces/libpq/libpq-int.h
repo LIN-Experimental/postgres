@@ -544,9 +544,7 @@ struct pg_conn
 	AddrInfo   *addr;			/* the array of addresses for the currently
 								 * tried host */
 	bool		send_appname;	/* okay to send application_name? */
-	size_t		scram_client_key_len;
 	uint8	   *scram_client_key_binary;	/* binary SCRAM client key */
-	size_t		scram_server_key_len;
 	uint8	   *scram_server_key_binary;	/* binary SCRAM server key */
 	ProtocolVersion min_pversion;	/* protocol version to request */
 	ProtocolVersion max_pversion;	/* protocol version to request */
@@ -621,7 +619,6 @@ struct pg_conn
 
 	/* SSL structures */
 	bool		ssl_in_use;
-	bool		ssl_handshake_started;
 	bool		ssl_cert_requested; /* Did the server ask us for a cert? */
 	bool		ssl_cert_sent;	/* Did we send one in reply? */
 	bool		last_read_was_eof;

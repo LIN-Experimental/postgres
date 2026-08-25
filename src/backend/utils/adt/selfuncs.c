@@ -671,7 +671,8 @@ scalarineqsel(PlannerInfo *root, Oid operator, bool isgt, bool iseq,
 		 * make an estimate based on comparing the constant to the table size.
 		 */
 		if (vardata->var && IsA(vardata->var, Var) &&
-			((Var *) vardata->var)->varattno == SelfItemPointerAttributeNumber)
+			((Var *) vardata->var)->varattno == SelfItemPointerAttributeNumber &&
+			consttype == TIDOID)
 		{
 			ItemPointer itemptr;
 			double		block;
@@ -2470,8 +2471,8 @@ eqjoinsel(PG_FUNCTION_ARGS)
 	if (have_mcvs1 && have_mcvs2)
 	{
 		fmgr_info(opfuncoid, &eqproc);
-		hasmatch1 = (bool *) palloc0(sslot1.nvalues * sizeof(bool));
-		hasmatch2 = (bool *) palloc0(sslot2.nvalues * sizeof(bool));
+		hasmatch1 = palloc0_array(bool, sslot1.nvalues);
+		hasmatch2 = palloc0_array(bool, sslot2.nvalues);
 
 		/*
 		 * If the MCV lists are long enough to justify hashing, try to look up

@@ -1883,6 +1883,8 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 	systable_inplace_update_finish(inplace_state, tup);
 	XLogFlush(XactLastRecEnd);
 
+	INJECTION_POINT("dropdb-after-invalid-marker", NULL);
+
 	/*
 	 * Also delete the tuple - transactionally. If this transaction commits,
 	 * the row will be gone, but if we fail, dropdb() can be invoked again.
@@ -3101,7 +3103,7 @@ remove_dbtablespaces(Oid db_id)
 		return;
 	}
 
-	tablespace_ids = (Oid *) palloc(ntblspc * sizeof(Oid));
+	tablespace_ids = palloc_array(Oid, ntblspc);
 	i = 0;
 	foreach(cell, ltblspc)
 		tablespace_ids[i++] = lfirst_oid(cell);

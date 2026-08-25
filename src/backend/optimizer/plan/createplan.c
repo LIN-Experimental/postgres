@@ -1033,21 +1033,22 @@ create_gating_plan(PlannerInfo *root, Path *path, Plan *plan,
 							   (Node *) gating_quals, plan);
 
 	/*
-	 * We might have had a trivial Result plan already.  Stacking one Result
-	 * atop another is silly, so if that applies, just discard the input plan.
-	 * (We're assuming its targetlist is uninteresting; it should be either
-	 * the same as the result of build_path_tlist, or a simplified version.
-	 * However, we preserve the set of relids that it purports to scan and
-	 * attribute that to our replacement Result instead, and likewise for the
-	 * result_type.)
+	 * See if we can reduce down stacked Result nodes to a single node.  This
+	 * is only possible when the nested Result has no subplan and no gating
+	 * qual.  If we do remove the nested Result, we maintain the relids and
+	 * result_type for EXPLAIN.
 	 */
 	if (IsA(plan, Result))
 	{
 		Result	   *rplan = (Result *) plan;
 
-		gplan->plan.lefttree = NULL;
-		gplan->relids = rplan->relids;
-		gplan->result_type = rplan->result_type;
+		if (rplan->plan.lefttree == NULL &&
+			rplan->resconstantqual == NULL)
+		{
+			gplan->plan.lefttree = NULL;
+			gplan->relids = rplan->relids;
+			gplan->result_type = rplan->result_type;
+		}
 	}
 
 	/*
@@ -1735,8 +1736,8 @@ create_memoize_plan(PlannerInfo *root, MemoizePath *best_path, int flags)
 
 	nkeys = list_length(param_exprs);
 	Assert(nkeys > 0);
-	operators = palloc(nkeys * sizeof(Oid));
-	collations = palloc(nkeys * sizeof(Oid));
+	operators = palloc_array(Oid, nkeys);
+	collations = palloc_array(Oid, nkeys);
 
 	i = 0;
 	forboth(lc, param_exprs, lc2, best_path->hash_operators)
@@ -2073,6 +2074,7 @@ create_incrementalsort_plan(PlannerInfo *root, IncrementalSortPath *best_path,
 											  best_path->nPresortedCols);
 
 	copy_generic_path_info(&plan->sort.plan, (Path *) best_path);
+	plan->numGroups = best_path->numGroups;
 
 	return plan;
 }
@@ -2277,7 +2279,7 @@ create_groupingsets_plan(PlannerInfo *root, GroupingSetsPath *best_path)
 			maxref = gc->tleSortGroupRef;
 	}
 
-	grouping_map = (AttrNumber *) palloc0((maxref + 1) * sizeof(AttrNumber));
+	grouping_map = palloc0_array(AttrNumber, maxref + 1);
 
 	/* Now look up the column numbers in the child's tlist */
 	foreach(lc, root->processed_groupClause)
@@ -2716,9 +2718,9 @@ create_limit_plan(PlannerInfo *root, LimitPath *best_path, int flags)
 		ListCell   *l;
 
 		numUniqkeys = list_length(parse->sortClause);
-		uniqColIdx = (AttrNumber *) palloc(numUniqkeys * sizeof(AttrNumber));
-		uniqOperators = (Oid *) palloc(numUniqkeys * sizeof(Oid));
-		uniqCollations = (Oid *) palloc(numUniqkeys * sizeof(Oid));
+		uniqColIdx = palloc_array(AttrNumber, numUniqkeys);
+		uniqOperators = palloc_array(Oid, numUniqkeys);
+		uniqCollations = palloc_array(Oid, numUniqkeys);
 
 		numUniqkeys = 0;
 		foreach(l, parse->sortClause)
@@ -4545,10 +4547,10 @@ create_mergejoin_plan(PlannerInfo *root,
 	 */
 	nClauses = list_length(mergeclauses);
 	Assert(nClauses == list_length(best_path->path_mergeclauses));
-	mergefamilies = (Oid *) palloc(nClauses * sizeof(Oid));
-	mergecollations = (Oid *) palloc(nClauses * sizeof(Oid));
-	mergereversals = (bool *) palloc(nClauses * sizeof(bool));
-	mergenullsfirst = (bool *) palloc(nClauses * sizeof(bool));
+	mergefamilies = palloc_array(Oid, nClauses);
+	mergecollations = palloc_array(Oid, nClauses);
+	mergereversals = palloc_array(bool, nClauses);
+	mergenullsfirst = palloc_array(bool, nClauses);
 
 	opathkey = NULL;
 	opeclass = NULL;
@@ -5312,7 +5314,7 @@ order_qual_clauses(PlannerInfo *root, List *clauses)
 	 * Collect the items and costs into an array.  This is to avoid repeated
 	 * cost_qual_eval work if the inputs aren't RestrictInfos.
 	 */
-	items = (QualItem *) palloc(nitems * sizeof(QualItem));
+	items = palloc_array(QualItem, nitems);
 	i = 0;
 	foreach(lc, clauses)
 	{
@@ -5468,7 +5470,8 @@ label_incrementalsort_with_costsize(PlannerInfo *root, IncrementalSort *plan,
 						  lefttree->plan_width,
 						  0.0,
 						  work_mem,
-						  limit_tuples);
+						  limit_tuples,
+						  &plan->numGroups);
 	plan->sort.plan.startup_cost = sort_path.startup_cost;
 	plan->sort.plan.total_cost = sort_path.total_cost;
 	plan->sort.plan.plan_rows = lefttree->plan_rows;
@@ -6198,10 +6201,10 @@ prepare_sort_from_pathkeys(Plan *lefttree, List *pathkeys,
 	 * We will need at most list_length(pathkeys) sort columns; possibly less
 	 */
 	numsortkeys = list_length(pathkeys);
-	sortColIdx = (AttrNumber *) palloc(numsortkeys * sizeof(AttrNumber));
-	sortOperators = (Oid *) palloc(numsortkeys * sizeof(Oid));
-	collations = (Oid *) palloc(numsortkeys * sizeof(Oid));
-	nullsFirst = (bool *) palloc(numsortkeys * sizeof(bool));
+	sortColIdx = palloc_array(AttrNumber, numsortkeys);
+	sortOperators = palloc_array(Oid, numsortkeys);
+	collations = palloc_array(Oid, numsortkeys);
+	nullsFirst = palloc_array(bool, numsortkeys);
 
 	numsortkeys = 0;
 
@@ -6439,10 +6442,10 @@ make_sort_from_sortclauses(List *sortcls, Plan *lefttree)
 
 	/* Convert list-ish representation to arrays wanted by executor */
 	numsortkeys = list_length(sortcls);
-	sortColIdx = (AttrNumber *) palloc(numsortkeys * sizeof(AttrNumber));
-	sortOperators = (Oid *) palloc(numsortkeys * sizeof(Oid));
-	collations = (Oid *) palloc(numsortkeys * sizeof(Oid));
-	nullsFirst = (bool *) palloc(numsortkeys * sizeof(bool));
+	sortColIdx = palloc_array(AttrNumber, numsortkeys);
+	sortOperators = palloc_array(Oid, numsortkeys);
+	collations = palloc_array(Oid, numsortkeys);
+	nullsFirst = palloc_array(bool, numsortkeys);
 
 	numsortkeys = 0;
 	foreach(l, sortcls)
@@ -6490,10 +6493,10 @@ make_sort_from_groupcols(List *groupcls,
 
 	/* Convert list-ish representation to arrays wanted by executor */
 	numsortkeys = list_length(groupcls);
-	sortColIdx = (AttrNumber *) palloc(numsortkeys * sizeof(AttrNumber));
-	sortOperators = (Oid *) palloc(numsortkeys * sizeof(Oid));
-	collations = (Oid *) palloc(numsortkeys * sizeof(Oid));
-	nullsFirst = (bool *) palloc(numsortkeys * sizeof(bool));
+	sortColIdx = palloc_array(AttrNumber, numsortkeys);
+	sortOperators = palloc_array(Oid, numsortkeys);
+	collations = palloc_array(Oid, numsortkeys);
+	nullsFirst = palloc_array(bool, numsortkeys);
 
 	numsortkeys = 0;
 	foreach(l, groupcls)

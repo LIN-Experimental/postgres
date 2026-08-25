@@ -248,6 +248,14 @@ typedef struct VacuumParams
 	 * disabled.
 	 */
 	int			nworkers;
+
+	/*
+	 * When vacuuming a TOAST table, this holds the main table's storage
+	 * parameters (or NULL if it doesn't have any).  If a storage parameter is
+	 * unset on the TOAST table but _is_ set on the main table, we use the
+	 * main table's setting.
+	 */
+	const struct StdRdOptions *main_relopts;
 } VacuumParams;
 
 /*
@@ -389,7 +397,7 @@ extern bool vacuum_xid_failsafe_check(const struct VacuumCutoffs *cutoffs);
 extern void vac_update_datfrozenxid(void);
 extern void vacuum_delay_point(bool is_analyze);
 extern bool vacuum_is_permitted_for_relation(Oid relid, Form_pg_class reltuple,
-											 uint32 options);
+											 uint32 options, bool missing_ok);
 extern Relation vacuum_open_relation(Oid relid, RangeVar *relation,
 									 uint32 options, bool verbose,
 									 LOCKMODE lmode);

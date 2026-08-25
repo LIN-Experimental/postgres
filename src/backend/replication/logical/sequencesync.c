@@ -755,7 +755,7 @@ LogicalRepSyncSequences(void)
 		/*
 		 * Lock the sequence so its identity (namespace and name) cannot
 		 * change under us via a concurrent DROP, RENAME or SET SCHEMA. The
-		 * lock is released immediately rathen than at the transaction end.
+		 * lock is released immediately rather than at the transaction end.
 		 * The later synchronization does not depend on this captured identity
 		 * remaining valid, as it re-opens the sequence and tolerates
 		 * concurrent changes. Releasing early also avoids holding one lock
@@ -815,7 +815,7 @@ LogicalRepSyncSequences(void)
 	 * Establish the connection to the publisher for sequence synchronization.
 	 */
 	LogRepWorkerWalRcvConn =
-		walrcv_connect(MySubscription->conninfo, true, true,
+		walrcv_connect(MySubscriptionConninfo, true, true,
 					   must_use_password,
 					   app_name.data, &err);
 	if (LogRepWorkerWalRcvConn == NULL)

@@ -1931,6 +1931,13 @@ getCopyDataMessage(PGconn *conn)
 				return -1;
 		}
 
+		/*
+		 * An error may have been triggered while processing the message,
+		 * report it if it's the case
+		 */
+		if (conn->error_result && conn->status == CONNECTION_BAD)
+			return -2;
+
 		/* Drop the processed message and loop around for another */
 		pqParseDone(conn, conn->inCursor);
 	}
@@ -2200,7 +2207,7 @@ pqEndcopy3(PGconn *conn)
 
 
 /*
- * PQfn - Send a function call to the POSTGRES backend.
+ * PQnfn - Send a function call to the POSTGRES backend.
  *
  * See fe-exec.c for documentation.
  */
@@ -2217,10 +2224,10 @@ pqFunctionCall3(PGconn *conn, Oid fnid,
 	int			avail;
 	int			i;
 
-	/* already validated by PQfn */
+	/* already validated by PQnfn */
 	Assert(conn->pipelineStatus == PQ_PIPELINE_OFF);
 
-	/* PQfn already validated connection state */
+	/* PQnfn already validated connection state */
 
 	if (pqPutMsgStart(PqMsg_FunctionCall, conn) < 0 ||
 		pqPutInt(fnid, 4, conn) < 0 ||	/* function id */
@@ -2424,6 +2431,13 @@ pqFunctionCall3(PGconn *conn, Oid fnid,
 				conn->inStart += 5 + msgLength;
 				return pqPrepareAsyncResult(conn);
 		}
+
+		/*
+		 * An error may have been triggered while processing the message, bail
+		 * out
+		 */
+		if (conn->error_result && conn->status == CONNECTION_BAD)
+			return pqPrepareAsyncResult(conn);
 
 		/* Completed parsing this message, keep going */
 		pqParseDone(conn, conn->inStart + 5 + msgLength);

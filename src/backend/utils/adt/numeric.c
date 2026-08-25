@@ -476,7 +476,7 @@ static void dump_var(const char *str, NumericVar *var);
 #endif
 
 #define digitbuf_alloc(ndigits)  \
-	((NumericDigit *) palloc((ndigits) * sizeof(NumericDigit)))
+	(palloc_array(NumericDigit, (ndigits)))
 #define digitbuf_free(buf)	\
 	do { \
 		 if ((buf) != NULL) \
@@ -5015,7 +5015,15 @@ numeric_combine(PG_FUNCTION_ARGS)
 	state2 = PG_ARGISNULL(1) ? NULL : (NumericAggState *) PG_GETARG_POINTER(1);
 
 	if (state2 == NULL)
+	{
+		/*
+		 * NULL state2 is easy, just return state1, which we know is already
+		 * in the agg_context
+		 */
+		if (state1 == NULL)
+			PG_RETURN_NULL();
 		PG_RETURN_POINTER(state1);
+	}
 
 	/* manually copy all fields from state2 to state1 */
 	if (state1 == NULL)
@@ -5107,7 +5115,15 @@ numeric_avg_combine(PG_FUNCTION_ARGS)
 	state2 = PG_ARGISNULL(1) ? NULL : (NumericAggState *) PG_GETARG_POINTER(1);
 
 	if (state2 == NULL)
+	{
+		/*
+		 * NULL state2 is easy, just return state1, which we know is already
+		 * in the agg_context
+		 */
+		if (state1 == NULL)
+			PG_RETURN_NULL();
 		PG_RETURN_POINTER(state1);
+	}
 
 	/* manually copy all fields from state2 to state1 */
 	if (state1 == NULL)
@@ -5571,7 +5587,15 @@ numeric_poly_combine(PG_FUNCTION_ARGS)
 	state2 = PG_ARGISNULL(1) ? NULL : (Int128AggState *) PG_GETARG_POINTER(1);
 
 	if (state2 == NULL)
+	{
+		/*
+		 * NULL state2 is easy, just return state1, which we know is already
+		 * in the agg_context
+		 */
+		if (state1 == NULL)
+			PG_RETURN_NULL();
 		PG_RETURN_POINTER(state1);
+	}
 
 	/* manually copy all fields from state2 to state1 */
 	if (state1 == NULL)
@@ -5732,7 +5756,15 @@ int8_avg_combine(PG_FUNCTION_ARGS)
 	state2 = PG_ARGISNULL(1) ? NULL : (Int128AggState *) PG_GETARG_POINTER(1);
 
 	if (state2 == NULL)
+	{
+		/*
+		 * NULL state2 is easy, just return state1, which we know is already
+		 * in the agg_context
+		 */
+		if (state1 == NULL)
+			PG_RETURN_NULL();
 		PG_RETURN_POINTER(state1);
+	}
 
 	/* manually copy all fields from state2 to state1 */
 	if (state1 == NULL)
@@ -12052,8 +12084,8 @@ accum_sum_rescale(NumericSumAccum *accum, const NumericVar *val)
 
 		weightdiff = accum_weight - old_weight;
 
-		new_pos_digits = palloc0(accum_ndigits * sizeof(int32));
-		new_neg_digits = palloc0(accum_ndigits * sizeof(int32));
+		new_pos_digits = palloc0_array(int32, accum_ndigits);
+		new_neg_digits = palloc0_array(int32, accum_ndigits);
 
 		if (accum->pos_digits)
 		{
@@ -12141,8 +12173,8 @@ accum_sum_final(NumericSumAccum *accum, NumericVar *result)
 static void
 accum_sum_copy(NumericSumAccum *dst, NumericSumAccum *src)
 {
-	dst->pos_digits = palloc(src->ndigits * sizeof(int32));
-	dst->neg_digits = palloc(src->ndigits * sizeof(int32));
+	dst->pos_digits = palloc_array(int32, src->ndigits);
+	dst->neg_digits = palloc_array(int32, src->ndigits);
 
 	memcpy(dst->pos_digits, src->pos_digits, src->ndigits * sizeof(int32));
 	memcpy(dst->neg_digits, src->neg_digits, src->ndigits * sizeof(int32));

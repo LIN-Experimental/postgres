@@ -31,6 +31,7 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
+#include "access/reloptions.h"
 #include "access/tableam.h"
 #include "access/transam.h"
 #include "access/xact.h"
@@ -187,6 +188,7 @@ ExecVacuum(ParseState *pstate, VacuumStmt *vacstmt, bool isTopLevel)
 
 	/* Will be set later if we recurse to a TOAST table. */
 	params.toast_parent = InvalidOid;
+	params.main_relopts = NULL;
 
 	/*
 	 * Set this to an invalid value so it is clear whether or not a
@@ -715,14 +717,21 @@ vacuum(List *relations, const VacuumParams *params, BufferAccessStrategy bstrate
  * If not, issue a WARNING log message and return false to let the caller
  * decide what to do with this relation.  This routine is used to decide if a
  * relation can be processed for VACUUM or ANALYZE.
+ *
+ * If missing_ok is true, we silently return false if the relation is
+ * concurrently dropped.  Callers without a lock on the relation must specify
+ * missing_ok; all others must hold at least AccessShareLock.
  */
 bool
 vacuum_is_permitted_for_relation(Oid relid, Form_pg_class reltuple,
-								 uint32 options)
+								 uint32 options, bool missing_ok)
 {
 	char	   *relname;
+	bool		is_missing = false;
 
 	Assert((options & (VACOPT_VACUUM | VACOPT_ANALYZE)) != 0);
+	Assert(missing_ok ||
+		   CheckRelationOidLockedByMe(relid, AccessShareLock, true));
 
 	/*----------
 	 * A role has privileges to vacuum or analyze the relation if any of the
@@ -733,8 +742,19 @@ vacuum_is_permitted_for_relation(Oid relid, Form_pg_class reltuple,
 	 */
 	if ((object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()) &&
 		 !reltuple->relisshared) ||
-		pg_class_aclcheck(relid, GetUserId(), ACL_MAINTAIN) == ACLCHECK_OK)
+		pg_class_aclcheck_ext(relid, GetUserId(), ACL_MAINTAIN,
+							  missing_ok ? &is_missing : NULL) == ACLCHECK_OK)
 		return true;
+
+	/*
+	 * If the relation was concurrently dropped, nothing to do.  Note that
+	 * this is only reachable when the caller specified missing_ok.
+	 */
+	if (is_missing)
+	{
+		Assert(missing_ok);
+		return false;
+	}
 
 	relname = NameStr(reltuple->relname);
 
@@ -956,7 +976,7 @@ expand_vacuum_rel(VacuumRelation *vrel, MemoryContext vac_context,
 		 * Make a returnable VacuumRelation for this rel if the user has the
 		 * required privileges.
 		 */
-		if (vacuum_is_permitted_for_relation(relid, classForm, options))
+		if (vacuum_is_permitted_for_relation(relid, classForm, options, false))
 		{
 			oldcontext = MemoryContextSwitchTo(vac_context);
 			vacrels = lappend(vacrels, makeVacuumRelation(vrel->relation,
@@ -1069,7 +1089,7 @@ get_all_vacuum_rels(MemoryContext vac_context, int options)
 			continue;
 
 		/* check permissions of relation */
-		if (!vacuum_is_permitted_for_relation(relid, classForm, options))
+		if (!vacuum_is_permitted_for_relation(relid, classForm, options, true))
 			continue;
 
 		/*
@@ -2021,6 +2041,8 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams params,
 	int			save_sec_context;
 	int			save_nestlevel;
 	VacuumParams toast_vacuum_params;
+	StdRdOptions *relopts;
+	StdRdOptions relopts_copy;
 
 	/*
 	 * This function scribbles on the parameters, so make a copy early to
@@ -2115,7 +2137,8 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams params,
 	 */
 	if (!vacuum_is_permitted_for_relation(priv_relid,
 										  rel->rd_rel,
-										  params.options & ~VACOPT_ANALYZE))
+										  params.options & ~VACOPT_ANALYZE,
+										  false))
 	{
 		relation_close(rel, lmode);
 		PopActiveSnapshot();
@@ -2183,6 +2206,15 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams params,
 	LockRelationIdForSession(&lockrelid, lmode);
 
 	/*
+	 * Determine the storage parameters to use.  A TOAST table takes any
+	 * storage parameter it accepts but does not set from its main table,
+	 * whose parameters the caller handed down for that purpose.  For anything
+	 * else, params.main_relopts is NULL, and this just copies our own.
+	 */
+	relopts = merge_toast_reloptions((StdRdOptions *) rel->rd_options,
+									 params.main_relopts);
+
+	/*
 	 * Set index_cleanup option based on index_cleanup reloption if it wasn't
 	 * specified in VACUUM command, or when running in an autovacuum worker
 	 */
@@ -2190,21 +2222,25 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams params,
 	{
 		StdRdOptIndexCleanup vacuum_index_cleanup;
 
-		if (rel->rd_options == NULL)
-			vacuum_index_cleanup = STDRD_OPTION_VACUUM_INDEX_CLEANUP_AUTO;
+		if (relopts == NULL)
+			vacuum_index_cleanup = STDRD_OPTION_VACUUM_INDEX_CLEANUP_NOT_SET;
 		else
-			vacuum_index_cleanup =
-				((StdRdOptions *) rel->rd_options)->vacuum_index_cleanup;
+			vacuum_index_cleanup = relopts->vacuum_index_cleanup;
 
-		if (vacuum_index_cleanup == STDRD_OPTION_VACUUM_INDEX_CLEANUP_AUTO)
-			params.index_cleanup = VACOPTVALUE_AUTO;
-		else if (vacuum_index_cleanup == STDRD_OPTION_VACUUM_INDEX_CLEANUP_ON)
-			params.index_cleanup = VACOPTVALUE_ENABLED;
-		else
+		switch (vacuum_index_cleanup)
 		{
-			Assert(vacuum_index_cleanup ==
-				   STDRD_OPTION_VACUUM_INDEX_CLEANUP_OFF);
-			params.index_cleanup = VACOPTVALUE_DISABLED;
+			case STDRD_OPTION_VACUUM_INDEX_CLEANUP_ON:
+				params.index_cleanup = VACOPTVALUE_ENABLED;
+				break;
+			case STDRD_OPTION_VACUUM_INDEX_CLEANUP_OFF:
+				params.index_cleanup = VACOPTVALUE_DISABLED;
+				break;
+			case STDRD_OPTION_VACUUM_INDEX_CLEANUP_AUTO:
+				params.index_cleanup = VACOPTVALUE_AUTO;
+				break;
+			case STDRD_OPTION_VACUUM_INDEX_CLEANUP_NOT_SET:
+				params.index_cleanup = VACOPTVALUE_AUTO;
+				break;
 		}
 	}
 
@@ -2221,10 +2257,8 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams params,
 	 * Check if the vacuum_max_eager_freeze_failure_rate table storage
 	 * parameter was specified. This overrides the GUC value.
 	 */
-	if (rel->rd_options != NULL &&
-		((StdRdOptions *) rel->rd_options)->vacuum_max_eager_freeze_failure_rate >= 0)
-		params.max_eager_freeze_failure_rate =
-			((StdRdOptions *) rel->rd_options)->vacuum_max_eager_freeze_failure_rate;
+	if (relopts != NULL && relopts->vacuum_max_eager_freeze_failure_rate >= 0)
+		params.max_eager_freeze_failure_rate = relopts->vacuum_max_eager_freeze_failure_rate;
 
 	/*
 	 * Set truncate option based on truncate reloption or GUC if it wasn't
@@ -2232,11 +2266,9 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams params,
 	 */
 	if (params.truncate == VACOPTVALUE_UNSPECIFIED)
 	{
-		StdRdOptions *opts = (StdRdOptions *) rel->rd_options;
-
-		if (opts && opts->vacuum_truncate != PG_TERNARY_UNSET)
+		if (relopts && relopts->vacuum_truncate != PG_TERNARY_UNSET)
 		{
-			if (opts->vacuum_truncate == PG_TERNARY_TRUE)
+			if (relopts->vacuum_truncate == PG_TERNARY_TRUE)
 				params.truncate = VACOPTVALUE_ENABLED;
 			else
 				params.truncate = VACOPTVALUE_DISABLED;
@@ -2268,6 +2300,17 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams params,
 		toast_relid = rel->rd_rel->reltoastrelid;
 	else
 		toast_relid = InvalidOid;
+
+	/*
+	 * Hand our storage parameters down for the TOAST table to inherit.  Take
+	 * a copy while we still have the relation open; the relcache entry can go
+	 * away once we close it.
+	 */
+	if (OidIsValid(toast_relid) && rel->rd_options)
+	{
+		memcpy(&relopts_copy, rel->rd_options, sizeof(StdRdOptions));
+		toast_vacuum_params.main_relopts = &relopts_copy;
+	}
 
 	/*
 	 * Switch to the table owner's userid, so that any index functions are run
@@ -2386,7 +2429,7 @@ vac_open_indexes(Relation relation, LOCKMODE lockmode,
 	i = list_length(indexoidlist);
 
 	if (i > 0)
-		*Irel = (Relation *) palloc(i * sizeof(Relation));
+		*Irel = palloc_array(Relation, i);
 	else
 		*Irel = NULL;
 

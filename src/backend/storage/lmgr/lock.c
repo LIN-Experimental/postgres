@@ -913,13 +913,23 @@ LockAcquireExtended(const LOCKTAG *locktag,
 	else
 	{
 		/* Make sure there will be room to remember the lock */
-		if (locallock->numLockOwners >= locallock->maxLockOwners)
+		if (locallock->lockOwners == NULL)
+		{
+			/*
+			 * A prior acquisition may leave the array unallocated after an
+			 * out-of-memory failure.
+			 */
+			locallock->maxLockOwners = 8;
+			locallock->lockOwners = (LOCALLOCKOWNER *)
+				MemoryContextAlloc(TopMemoryContext,
+								   locallock->maxLockOwners * sizeof(LOCALLOCKOWNER));
+		}
+		else if (locallock->numLockOwners >= locallock->maxLockOwners)
 		{
 			int			newsize = locallock->maxLockOwners * 2;
 
-			locallock->lockOwners = (LOCALLOCKOWNER *)
-				repalloc(locallock->lockOwners,
-						 newsize * sizeof(LOCALLOCKOWNER));
+			locallock->lockOwners = repalloc_array(locallock->lockOwners,
+												   LOCALLOCKOWNER, newsize);
 			locallock->maxLockOwners = newsize;
 		}
 	}
@@ -3828,8 +3838,7 @@ GetLockStatusData(void)
 				if (el >= els)
 				{
 					els += MaxBackends;
-					data->locks = (LockInstanceData *)
-						repalloc(data->locks, sizeof(LockInstanceData) * els);
+					data->locks = repalloc_array(data->locks, LockInstanceData, els);
 				}
 
 				instance = &data->locks[el];
@@ -3861,8 +3870,7 @@ GetLockStatusData(void)
 			if (el >= els)
 			{
 				els += MaxBackends;
-				data->locks = (LockInstanceData *)
-					repalloc(data->locks, sizeof(LockInstanceData) * els);
+				data->locks = repalloc_array(data->locks, LockInstanceData, els);
 			}
 
 			vxid.procNumber = proc->vxid.procNumber;
@@ -3906,8 +3914,7 @@ GetLockStatusData(void)
 	if (data->nelements > els)
 	{
 		els = data->nelements;
-		data->locks = (LockInstanceData *)
-			repalloc(data->locks, sizeof(LockInstanceData) * els);
+		data->locks = repalloc_array(data->locks, LockInstanceData, els);
 	}
 
 	/* Now scan the tables to copy the data */
@@ -4090,8 +4097,7 @@ GetSingleProcBlockerStatusData(PGPROC *blocked_proc, BlockedProcsData *data)
 		if (data->nlocks >= data->maxlocks)
 		{
 			data->maxlocks += MaxBackends;
-			data->locks = (LockInstanceData *)
-				repalloc(data->locks, sizeof(LockInstanceData) * data->maxlocks);
+			data->locks = repalloc_array(data->locks, LockInstanceData, data->maxlocks);
 		}
 
 		instance = &data->locks[data->nlocks];
@@ -4117,8 +4123,7 @@ GetSingleProcBlockerStatusData(PGPROC *blocked_proc, BlockedProcsData *data)
 	{
 		data->maxpids = Max(data->maxpids + MaxBackends,
 							data->npids + queue_size);
-		data->waiter_pids = (int *) repalloc(data->waiter_pids,
-											 sizeof(int) * data->maxpids);
+		data->waiter_pids = repalloc_array(data->waiter_pids, int, data->maxpids);
 	}
 
 	/* Collect PIDs from the lock's wait queue, stopping at blocked_proc */
@@ -4172,7 +4177,7 @@ GetRunningTransactionLocks(int *nlocks)
 	 * Allocating enough space for all locks in the lock table is overkill,
 	 * but it's more convenient and faster than having to enlarge the array.
 	 */
-	accessExclusiveLocks = palloc(els * sizeof(xl_standby_lock));
+	accessExclusiveLocks = palloc_array(xl_standby_lock, els);
 
 	/* Now scan the tables to copy the data */
 	hash_seq_init(&seqstat, LockMethodProcLockHash);

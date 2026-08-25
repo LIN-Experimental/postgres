@@ -1254,7 +1254,17 @@ slot_deform_heap_tuple(TupleTableSlot *slot, HeapTuple tuple, uint32 *offp,
 		 * to implement a tail-call optimization
 		 */
 		*offp = off;
-		slot_getmissingattrs(slot, attnum, reqnatts);
+
+		Assert(HeapTupleHeaderGetNatts(tup) <= attnum);
+
+		/*
+		 * Fetch all missing attributes.  We pass natts rather than attnum as
+		 * if we're deforming attributes after having already deformed some
+		 * missing attributes, then the call to populate_isnull_array() may
+		 * have overwritten the previous tts_isnull values from what was
+		 * stored in the previous call to slot_getmissingattrs().
+		 */
+		slot_getmissingattrs(slot, HeapTupleHeaderGetNatts(tup), reqnatts);
 		return;
 	}
 done:
@@ -2379,9 +2389,9 @@ TupleDescGetAttInMetadata(TupleDesc tupdesc)
 	/*
 	 * Gather info needed later to call the "in" function for each attribute
 	 */
-	attinfuncinfo = (FmgrInfo *) palloc0(natts * sizeof(FmgrInfo));
-	attioparams = (Oid *) palloc0(natts * sizeof(Oid));
-	atttypmods = (int32 *) palloc0(natts * sizeof(int32));
+	attinfuncinfo = palloc0_array(FmgrInfo, natts);
+	attioparams = palloc0_array(Oid, natts);
+	atttypmods = palloc0_array(int32, natts);
 
 	for (i = 0; i < natts; i++)
 	{
@@ -2418,8 +2428,8 @@ BuildTupleFromCStrings(AttInMetadata *attinmeta, char **values)
 	int			i;
 	HeapTuple	tuple;
 
-	dvalues = (Datum *) palloc(natts * sizeof(Datum));
-	nulls = (bool *) palloc(natts * sizeof(bool));
+	dvalues = palloc_array(Datum, natts);
+	nulls = palloc_array(bool, natts);
 
 	/*
 	 * Call the "in" function for each non-dropped attribute, even for nulls,

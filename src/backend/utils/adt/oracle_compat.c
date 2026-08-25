@@ -424,8 +424,8 @@ dotrim(const char *string, int stringlen,
 			const char *str_pos;
 			int			str_len;
 
-			stringchars = (const char **) palloc(stringlen * sizeof(char *));
-			stringmblen = (int *) palloc(stringlen * sizeof(int));
+			stringchars = palloc_array(const char *, stringlen);
+			stringmblen = palloc_array(int, stringlen);
 			stringnchars = 0;
 			p = string;
 			len = stringlen;
@@ -439,8 +439,8 @@ dotrim(const char *string, int stringlen,
 				len -= mblen;
 			}
 
-			setchars = (const char **) palloc(setlen * sizeof(char *));
-			setmblen = (int *) palloc(setlen * sizeof(int));
+			setchars = palloc_array(const char *, setlen);
+			setmblen = palloc_array(int, setlen);
 			setnchars = 0;
 			p = set;
 			len = setlen;
@@ -952,8 +952,10 @@ ascii(PG_FUNCTION_ARGS)
 	text	   *string = PG_GETARG_TEXT_PP(0);
 	int			encoding = GetDatabaseEncoding();
 	unsigned char *data;
+	int			len;
 
-	if (VARSIZE_ANY_EXHDR(string) <= 0)
+	len = VARSIZE_ANY_EXHDR(string);
+	if (len <= 0)
 		PG_RETURN_INT32(0);
 
 	data = (unsigned char *) VARDATA_ANY(string);
@@ -976,18 +978,31 @@ ascii(PG_FUNCTION_ARGS)
 			result = *data & 0x0F;
 			tbytes = 2;
 		}
-		else
+		else if (*data > 0xC0)
 		{
-			Assert(*data > 0xC0);
 			result = *data & 0x1f;
 			tbytes = 1;
 		}
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_CHARACTER_NOT_IN_REPERTOIRE),
+					 errmsg("invalid byte sequence for encoding \"%s\"",
+							GetDatabaseEncodingName())));
 
-		Assert(tbytes > 0);
+		/* All continuation bytes are present in the input */
+		if (tbytes >= len)
+			ereport(ERROR,
+					(errcode(ERRCODE_CHARACTER_NOT_IN_REPERTOIRE),
+					 errmsg("invalid byte sequence for encoding \"%s\"",
+							GetDatabaseEncodingName())));
 
 		for (i = 1; i <= tbytes; i++)
 		{
-			Assert((data[i] & 0xC0) == 0x80);
+			if (unlikely((data[i] & 0xC0) != 0x80))
+				ereport(ERROR,
+						(errcode(ERRCODE_CHARACTER_NOT_IN_REPERTOIRE),
+						 errmsg("invalid byte sequence for encoding \"%s\"",
+								GetDatabaseEncodingName())));
 			result = (result << 6) + (data[i] & 0x3f);
 		}
 

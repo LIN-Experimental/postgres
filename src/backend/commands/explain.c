@@ -3306,10 +3306,15 @@ static void
 show_incremental_sort_info(IncrementalSortState *incrsortstate,
 						   ExplainState *es)
 {
+	IncrementalSort *plan = (IncrementalSort *) incrsortstate->ss.ps.plan;
 	IncrementalSortGroupInfo *fullsortGroupInfo;
 	IncrementalSortGroupInfo *prefixsortGroupInfo;
 
 	fullsortGroupInfo = &incrsortstate->incsort_info.fullsortGroupInfo;
+
+	if (es->costs)
+		ExplainPropertyFloat("Estimated Groups", NULL,
+							 plan->numGroups, 0, es);
 
 	if (!es->analyze)
 		return;
@@ -5189,10 +5194,9 @@ ExplainCreateWorkersState(int num_workers)
 
 	wstate = palloc_object(ExplainWorkersState);
 	wstate->num_workers = num_workers;
-	wstate->worker_inited = (bool *) palloc0(num_workers * sizeof(bool));
-	wstate->worker_str = (StringInfoData *)
-		palloc0(num_workers * sizeof(StringInfoData));
-	wstate->worker_state_save = (int *) palloc(num_workers * sizeof(int));
+	wstate->worker_inited = palloc0_array(bool, num_workers);
+	wstate->worker_str = palloc0_array(StringInfoData, num_workers);
+	wstate->worker_state_save = palloc_array(int, num_workers);
 	return wstate;
 }
 

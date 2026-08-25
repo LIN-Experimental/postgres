@@ -901,17 +901,6 @@ findDependentObjects(const ObjectAddress *object,
 			continue;
 
 		/*
-		 * Check that the dependent object is not in a shared catalog, which
-		 * is not supported by doDeletion().
-		 */
-		if (IsSharedRelation(otherObject.classId))
-			ereport(ERROR,
-					(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
-					 errmsg("cannot drop %s because %s depends on it",
-							getObjectDescription(object, false),
-							getObjectDescription(&otherObject, false))));
-
-		/*
 		 * Must lock the dependent object before recursing to it.
 		 */
 		AcquireDeletionLock(&otherObject, 0);
@@ -929,6 +918,22 @@ findDependentObjects(const ObjectAddress *object,
 			ReleaseDeletionLock(&otherObject);
 			/* and continue scanning for dependencies */
 			continue;
+		}
+
+		/*
+		 * Check that the dependent object is not in a shared catalog, which
+		 * is not supported by doDeletion().
+		 */
+		if (IsSharedRelation(otherObject.classId))
+		{
+			char	   *otherObjDesc = getObjectDescription(&otherObject,
+															false);
+
+			ereport(ERROR,
+					(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
+					 errmsg("cannot drop %s because %s depends on it",
+							getObjectDescription(object, false), otherObjDesc),
+					 errhint("Drop %s first.", otherObjDesc)));
 		}
 
 		/*
@@ -966,9 +971,9 @@ findDependentObjects(const ObjectAddress *object,
 		{
 			/* enlarge array if needed */
 			maxDependentObjects *= 2;
-			dependentObjects = (ObjectAddressAndFlags *)
-				repalloc(dependentObjects,
-						 maxDependentObjects * sizeof(ObjectAddressAndFlags));
+			dependentObjects = repalloc_array(dependentObjects,
+											  ObjectAddressAndFlags,
+											  maxDependentObjects);
 		}
 
 		dependentObjects[numDependentObjects].obj = otherObject;
@@ -1579,7 +1584,7 @@ AcquireDeletionLock(const ObjectAddress *object, int flags)
 		else
 			LockRelationOid(object->objectId, AccessExclusiveLock);
 	}
-	else if (object->classId == AuthMemRelationId)
+	else if (IsSharedRelation(object->classId))
 		LockSharedObject(object->classId, object->objectId, 0,
 						 AccessExclusiveLock);
 	else
@@ -1600,6 +1605,9 @@ ReleaseDeletionLock(const ObjectAddress *object)
 {
 	if (object->classId == RelationRelationId)
 		UnlockRelationOid(object->objectId, AccessExclusiveLock);
+	else if (IsSharedRelation(object->classId))
+		UnlockSharedObject(object->classId, object->objectId, 0,
+						   AccessExclusiveLock);
 	else
 		/* assume we should lock the whole object not a sub-object */
 		UnlockDatabaseObject(object->classId, object->objectId, 0,
@@ -1781,6 +1789,82 @@ recordDependencyOnSingleRelExpr(const ObjectAddress *depender,
 							   context.addrs->refs, context.addrs->numrefs,
 							   behavior);
 
+	free_object_addresses(context.addrs);
+}
+
+/*
+ * We require USAGE on a type to store a dependency on it.  This helper
+ * function does the appropriate privilege checks.
+ *
+ * NB: Other objects have privileges of their own, but recording those
+ * dependencies doesn't require holding them.  For example, an expression may
+ * reference a function for which the user lacks EXECUTE.  Instead, EXECUTE is
+ * checked when the function is executed.
+ */
+static void
+check_usage_on_types(ObjectAddresses *addrs, Oid roleid)
+{
+	for (int i = 0; i < addrs->numrefs; i++)
+	{
+		ObjectAddress *ref = &addrs->refs[i];
+		AclResult	aclresult;
+
+		if (ref->classId != TypeRelationId)
+			continue;
+
+		/* we don't record dependencies on pinned types */
+		if (IsPinnedObject(ref->classId, ref->objectId))
+			continue;
+
+		aclresult = object_aclcheck(ref->classId, ref->objectId,
+									roleid, ACL_USAGE);
+		if (aclresult != ACLCHECK_OK)
+			aclcheck_error_type(aclresult, ref->objectId);
+	}
+}
+
+/*
+ * CheckUsageOnTypesInExpr - require USAGE on all types named by an expression
+ *
+ * rtable is the rangetable for interpreting Vars (or NIL if none are
+ * expected).  roleid is the role whose USAGE is required.
+ */
+void
+CheckUsageOnTypesInExpr(Node *expr, List *rtable, Oid roleid)
+{
+	ObjectAddresses *addrs = new_object_addresses();
+
+	collectDependenciesOfExpr(addrs, expr, rtable);
+	eliminate_duplicate_dependencies(addrs);
+	check_usage_on_types(addrs, roleid);
+	free_object_addresses(addrs);
+}
+
+/*
+ * CheckUsageOnTypesInSingleRelExpr - as above, for a single-rel expression
+ *
+ * Like recordDependencyOnSingleRelExpr(), this handles expressions whose Vars
+ * all refer to one relation.  roleid is the role whose USAGE is required.
+ */
+void
+CheckUsageOnTypesInSingleRelExpr(Node *expr, Oid relId, Oid roleid)
+{
+	find_expr_references_context context;
+	RangeTblEntry rte = {0};
+
+	context.addrs = new_object_addresses();
+
+	/* We gin up a rather bogus rangetable list to handle Vars */
+	rte.type = T_RangeTblEntry;
+	rte.rtekind = RTE_RELATION;
+	rte.relid = relId;
+	rte.relkind = RELKIND_RELATION;
+	rte.rellockmode = AccessShareLock;
+	context.rtables = list_make1(list_make1(&rte));
+
+	find_expr_references_walker(expr, &context);
+	eliminate_duplicate_dependencies(context.addrs);
+	check_usage_on_types(context.addrs, roleid);
 	free_object_addresses(context.addrs);
 }
 
@@ -2729,8 +2813,7 @@ add_object_address(Oid classId, Oid objectId, int32 subId,
 	if (addrs->numrefs >= addrs->maxrefs)
 	{
 		addrs->maxrefs *= 2;
-		addrs->refs = (ObjectAddress *)
-			repalloc(addrs->refs, addrs->maxrefs * sizeof(ObjectAddress));
+		addrs->refs = repalloc_array(addrs->refs, ObjectAddress, addrs->maxrefs);
 		Assert(!addrs->extras);
 	}
 	/* record this item */
@@ -2756,8 +2839,7 @@ add_exact_object_address(const ObjectAddress *object,
 	if (addrs->numrefs >= addrs->maxrefs)
 	{
 		addrs->maxrefs *= 2;
-		addrs->refs = (ObjectAddress *)
-			repalloc(addrs->refs, addrs->maxrefs * sizeof(ObjectAddress));
+		addrs->refs = repalloc_array(addrs->refs, ObjectAddress, addrs->maxrefs);
 		Assert(!addrs->extras);
 	}
 	/* record this item */
@@ -2781,17 +2863,14 @@ add_exact_object_address_extra(const ObjectAddress *object,
 
 	/* allocate extra space if first time */
 	if (!addrs->extras)
-		addrs->extras = (ObjectAddressExtra *)
-			palloc(addrs->maxrefs * sizeof(ObjectAddressExtra));
+		addrs->extras = palloc_array(ObjectAddressExtra, addrs->maxrefs);
 
 	/* enlarge array if needed */
 	if (addrs->numrefs >= addrs->maxrefs)
 	{
 		addrs->maxrefs *= 2;
-		addrs->refs = (ObjectAddress *)
-			repalloc(addrs->refs, addrs->maxrefs * sizeof(ObjectAddress));
-		addrs->extras = (ObjectAddressExtra *)
-			repalloc(addrs->extras, addrs->maxrefs * sizeof(ObjectAddressExtra));
+		addrs->refs = repalloc_array(addrs->refs, ObjectAddress, addrs->maxrefs);
+		addrs->extras = repalloc_array(addrs->extras, ObjectAddressExtra, addrs->maxrefs);
 	}
 	/* record this item */
 	item = addrs->refs + addrs->numrefs;

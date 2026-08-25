@@ -493,7 +493,7 @@ NIAddSpell(IspellDict *Conf, const char *word, const char *flag)
 		if (Conf->mspell)
 		{
 			Conf->mspell *= 2;
-			Conf->Spell = (SPELL **) repalloc(Conf->Spell, Conf->mspell * sizeof(SPELL *));
+			Conf->Spell = repalloc_array(Conf->Spell, SPELL *, Conf->mspell);
 		}
 		else
 		{
@@ -687,7 +687,7 @@ NIAddAffix(IspellDict *Conf, const char *flag, char flagflags, const char *mask,
 		if (Conf->maffixes)
 		{
 			Conf->maffixes *= 2;
-			Conf->Affix = (AFFIX *) repalloc(Conf->Affix, Conf->maffixes * sizeof(AFFIX));
+			Conf->Affix = repalloc_array(Conf->Affix, AFFIX, Conf->maffixes);
 		}
 		else
 		{
@@ -1106,9 +1106,9 @@ addCompoundAffixFlagValue(IspellDict *Conf, const char *s, uint32 val)
 		if (Conf->mCompoundAffixFlag)
 		{
 			Conf->mCompoundAffixFlag *= 2;
-			Conf->CompoundAffixFlags = (CompoundAffixFlag *)
-				repalloc(Conf->CompoundAffixFlags,
-						 Conf->mCompoundAffixFlag * sizeof(CompoundAffixFlag));
+			Conf->CompoundAffixFlags = repalloc_array(Conf->CompoundAffixFlags,
+													  CompoundAffixFlag,
+													  Conf->mCompoundAffixFlag);
 		}
 		else
 		{
@@ -1182,12 +1182,18 @@ getAffixFlagSet(IspellDict *Conf, char *s)
 					 errmsg("invalid affix alias \"%s\"", s)));
 
 		if (curaffix > 0 && curaffix < Conf->nAffixData)
+		{
+			if (Conf->AffixData[curaffix] == NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_CONFIG_FILE_ERROR),
+						 errmsg("invalid affix alias \"%s\"", s)));
 
 			/*
 			 * Do not subtract 1 from curaffix because empty string was added
 			 * in NIImportOOAffixes
 			 */
 			return Conf->AffixData[curaffix];
+		}
 		else if (curaffix > Conf->nAffixData)
 			ereport(ERROR,
 					(errcode(ERRCODE_CONFIG_FILE_ERROR),
@@ -1422,6 +1428,13 @@ nextline:
 	tsearch_readline_end(&trst);
 	if (ptype)
 		pfree(ptype);
+
+	/* Reject incomplete AF alias table. */
+	if (Conf->useFlagAliases && curaffix != naffix)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONFIG_FILE_ERROR),
+				 errmsg("number of aliases is less than specified number %d",
+						naffix - 1)));
 }
 
 /*
@@ -1448,6 +1461,8 @@ NIImportAffixes(IspellDict *Conf, const char *filename)
 	tsearch_readline_state trst;
 	bool		oldformat = false;
 	char	   *recoded = NULL;
+
+	flag[0] = '\0';				/* no flag seen yet */
 
 	if (!tsearch_readline_begin(&trst, filename))
 		ereport(ERROR,
@@ -1596,8 +1611,7 @@ MergeAffix(IspellDict *Conf, int a1, int a2)
 	if (Conf->nAffixData + 1 >= Conf->lenAffixData)
 	{
 		Conf->lenAffixData *= 2;
-		Conf->AffixData = (const char **) repalloc(Conf->AffixData,
-												   sizeof(char *) * Conf->lenAffixData);
+		Conf->AffixData = repalloc_array(Conf->AffixData, const char *, Conf->lenAffixData);
 	}
 
 	ptr = Conf->AffixData + Conf->nAffixData;
@@ -1997,7 +2011,8 @@ NISortAffixes(IspellDict *Conf)
 	/* Store compound affixes in the Conf->CompoundAffix array */
 	if (Conf->naffixes > 1)
 		qsort(Conf->Affix, Conf->naffixes, sizeof(AFFIX), cmpaffix);
-	Conf->CompoundAffix = ptr = palloc_array(CMPDAffix, Conf->naffixes);
+	/* +1 for terminator */
+	Conf->CompoundAffix = ptr = palloc_array(CMPDAffix, Conf->naffixes + 1);
 	ptr->affix = NULL;
 
 	for (int i = 0; i < Conf->naffixes; i++)
@@ -2026,7 +2041,8 @@ NISortAffixes(IspellDict *Conf)
 		}
 	}
 	ptr->affix = NULL;
-	Conf->CompoundAffix = (CMPDAffix *) repalloc(Conf->CompoundAffix, sizeof(CMPDAffix) * (ptr - Conf->CompoundAffix + 1));
+	Conf->CompoundAffix = repalloc_array(Conf->CompoundAffix,
+										 CMPDAffix, ptr - Conf->CompoundAffix + 1);
 
 	/* Start build a prefix tree */
 	Conf->Prefix = mkANode(Conf, 0, firstsuffix, 0, FF_PREFIX);
@@ -2409,7 +2425,7 @@ AddStem(SplitVar *v, char *word)
 	if (v->nstem >= v->lenstem)
 	{
 		v->lenstem *= 2;
-		v->stem = (char **) repalloc(v->stem, sizeof(char *) * v->lenstem);
+		v->stem = repalloc_array(v->stem, char *, v->lenstem);
 	}
 
 	v->stem[v->nstem] = word;

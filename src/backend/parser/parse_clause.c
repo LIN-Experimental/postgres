@@ -946,6 +946,9 @@ transformRangeGraphTable(ParseState *pstate, RangeGraphTable *rgt)
 	ListCell   *lc;
 	int			resno = 0;
 	bool		saved_hasSublinks;
+	bool		saved_hasAggs;
+	bool		saved_hasWindowFuncs;
+	bool		saved_hasTargetSRFs;
 
 	rel = parserOpenPropGraph(pstate, rgt->graph_name, AccessShareLock);
 
@@ -966,6 +969,13 @@ transformRangeGraphTable(ParseState *pstate, RangeGraphTable *rgt)
 
 	saved_hasSublinks = pstate->p_hasSubLinks;
 	pstate->p_hasSubLinks = false;
+
+	saved_hasAggs = pstate->p_hasAggs;
+	pstate->p_hasAggs = false;
+	saved_hasWindowFuncs = pstate->p_hasWindowFuncs;
+	pstate->p_hasWindowFuncs = false;
+	saved_hasTargetSRFs = pstate->p_hasTargetSRFs;
+	pstate->p_hasTargetSRFs = false;
 
 	gp = transformGraphPattern(pstate, rgt->graph_pattern);
 
@@ -1030,6 +1040,26 @@ transformRangeGraphTable(ParseState *pstate, RangeGraphTable *rgt)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("subqueries within GRAPH_TABLE reference are not supported")));
 	pstate->p_hasSubLinks = saved_hasSublinks;
+
+	/*
+	 * GRAPH_TABLE cannot yet evaluate aggregate, window, or set-returning
+	 * functions in its COLUMNS list, so prohibit them for now.
+	 */
+	if (pstate->p_hasAggs)
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("aggregate functions in GRAPH_TABLE COLUMNS are not supported"));
+	if (pstate->p_hasWindowFuncs)
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("window functions in GRAPH_TABLE COLUMNS are not supported"));
+	if (pstate->p_hasTargetSRFs)
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("set-returning functions in GRAPH_TABLE COLUMNS are not supported"));
+	pstate->p_hasAggs = saved_hasAggs;
+	pstate->p_hasWindowFuncs = saved_hasWindowFuncs;
+	pstate->p_hasTargetSRFs = saved_hasTargetSRFs;
 
 	return addRangeTableEntryForGraphTable(pstate, graphid, castNode(GraphPattern, gp), columns, colnames, rgt->alias, false, true);
 }
@@ -1436,9 +1466,8 @@ transformFromClauseItem(ParseState *pstate, Node *n,
 		res_colvars = NIL;
 
 		/* this may be larger than needed, but it's not worth being exact */
-		res_nscolumns = (ParseNamespaceColumn *)
-			palloc0((list_length(l_colnames) + list_length(r_colnames)) *
-					sizeof(ParseNamespaceColumn));
+		res_nscolumns = palloc0_array(ParseNamespaceColumn,
+									  list_length(l_colnames) + list_length(r_colnames));
 		res_colindex = 0;
 
 		if (j->usingClause)

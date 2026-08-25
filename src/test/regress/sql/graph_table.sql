@@ -306,6 +306,10 @@ SELECT * FROM GRAPH_TABLE (g1 MATCH (src IS el1 | vl1)-[conn]->(dest) COLUMNS (c
 SELECT * FROM GRAPH_TABLE (myshop MATCH (c IS customers WHERE c.address = 'US')-[IS customer_orders]->(o IS orders) COLUMNS (c.*));
 -- star anywhere else is not allowed as a property reference
 SELECT * FROM GRAPH_TABLE (myshop MATCH (c IS customers WHERE c.* IS NOT NULL)-[IS customer_orders]->(o IS orders) COLUMNS (c.name));
+-- aggregate, window, and set-returning functions are not supported in COLUMNS
+SELECT * FROM GRAPH_TABLE (myshop MATCH (c IS customers) COLUMNS (count(*) AS num));
+SELECT * FROM GRAPH_TABLE (myshop MATCH (c IS customers) COLUMNS (row_number() OVER () AS rn));
+SELECT * FROM GRAPH_TABLE (myshop MATCH (c IS customers) COLUMNS (generate_series(1, 2) AS gs));
 -- consecutive element patterns with same kind
 SELECT * FROM GRAPH_TABLE (g1 MATCH ()() COLUMNS (1 as one));
 SELECT * FROM GRAPH_TABLE (g1 MATCH -> COLUMNS (1 AS one));
@@ -539,13 +543,14 @@ SELECT * FROM GRAPH_TABLE (g4 MATCH (s WHERE s.id = 3)-[e]-(d) COLUMNS (s.val, e
 -- GRAPH_TABLE in views
 
 -- The query in the view definition is intentionally complex to test one view with many
--- features like label disjunction, lateral references, WHERE clauses in graph
--- patterns.
+-- features like label disjunction, lateral references, WHERE clauses on graph
+-- pattern elements as well as on the whole graph pattern.
 CREATE VIEW customers_us AS
 SELECT g.* FROM x1,
                 GRAPH_TABLE (myshop MATCH (c IS customers WHERE c.address = 'US' AND c.customer_id = x1.a)
                                           -[IS customer_orders | customer_wishlists ]->
                                           (l IS orders | wishlists)-[ IS list_items]->(p IS products)
+                                    WHERE p.price > 0
                                     COLUMNS (c.name AS customer_name, p.name AS product_name, p.price, x1.a AS a)) g
            ORDER BY customer_name, product_name;
 -- Dropping properties or labels used by a view is not allowed
@@ -558,6 +563,19 @@ ALTER PROPERTY GRAPH myshop ALTER VERTEX TABLE products
     ALTER LABEL products DROP PROPERTIES (price);  -- error
 -- ruleutils reverse parsing
 SELECT pg_get_viewdef('customers_us'::regclass);
+
+-- l1 is shared by all vertex tables and edge tables.  Dropping it
+-- only from all vertex tables renders a view unusable.  It would
+-- probably be more correct that the DROP LABEL operations enforce
+-- RESTRICT or CASCADE.
+CREATE VIEW v_shared_label AS SELECT * FROM GRAPH_TABLE (g1 MATCH (v IS l1) COLUMNS (v.elname));
+BEGIN;
+ALTER PROPERTY GRAPH g1 ALTER VERTEX TABLE v1 DROP LABEL l1;
+ALTER PROPERTY GRAPH g1 ALTER VERTEX TABLE v2 DROP LABEL l1;
+ALTER PROPERTY GRAPH g1 ALTER VERTEX TABLE v3 DROP LABEL l1;
+SELECT * FROM v_shared_label;
+ROLLBACK;
+SELECT pg_get_viewdef('v_shared_label'::regclass);
 
 -- test view/graph nesting
 

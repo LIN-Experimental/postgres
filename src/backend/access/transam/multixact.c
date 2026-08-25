@@ -1070,7 +1070,7 @@ GetNewMultiXactId(int nmembers, MultiXactOffset *offset)
 									   multiWrapLimit - result,
 									   oldest_datname,
 									   multiWrapLimit - result),
-						 errdetail("Approximately %.2f%% of MultiXactIds are available for use.",
+						 errdetail("Approximately %.2f%% of MultiXactId space remains before wraparound.",
 								   (double) (multiWrapLimit - result) / (MaxMultiXactId / 2) * 100),
 						 errhint("Execute a database-wide VACUUM in that database.\n"
 								 "You might also need to commit or roll back old prepared transactions.")));
@@ -1081,7 +1081,7 @@ GetNewMultiXactId(int nmembers, MultiXactOffset *offset)
 									   multiWrapLimit - result,
 									   oldest_datoid,
 									   multiWrapLimit - result),
-						 errdetail("Approximately %.2f%% of MultiXactIds are available for use.",
+						 errdetail("Approximately %.2f%% of MultiXactId space remains before wraparound.",
 								   (double) (multiWrapLimit - result) / (MaxMultiXactId / 2) * 100),
 						 errhint("Execute a database-wide VACUUM in that database.\n"
 								 "You might also need to commit or roll back old prepared transactions.")));
@@ -1337,7 +1337,7 @@ GetMultiXactIdMembers(MultiXactId multi, MultiXactMember **members,
 	length = nextMXOffset - offset;
 
 	/* read the members */
-	ptr = (MultiXactMember *) palloc(length * sizeof(MultiXactMember));
+	ptr = palloc_array(MultiXactMember, length);
 	prev_pageno = -1;
 	for (int i = 0; i < length; i++, offset++)
 	{
@@ -2208,7 +2208,7 @@ SetMultiXactIdLimit(MultiXactId oldest_datminmxid, Oid oldest_datoid)
 								   multiWrapLimit - curMulti,
 								   oldest_datname,
 								   multiWrapLimit - curMulti),
-					 errdetail("Approximately %.2f%% of MultiXactIds are available for use.",
+					 errdetail("Approximately %.2f%% of MultiXactId space remains before wraparound.",
 							   (double) (multiWrapLimit - curMulti) / (MaxMultiXactId / 2) * 100),
 					 errhint("To avoid MultiXactId assignment failures, execute a database-wide VACUUM in that database.\n"
 							 "You might also need to commit or roll back old prepared transactions.")));
@@ -2219,7 +2219,7 @@ SetMultiXactIdLimit(MultiXactId oldest_datminmxid, Oid oldest_datoid)
 								   multiWrapLimit - curMulti,
 								   oldest_datoid,
 								   multiWrapLimit - curMulti),
-					 errdetail("Approximately %.2f%% of MultiXactIds are available for use.",
+					 errdetail("Approximately %.2f%% of MultiXactId space remains before wraparound.",
 							   (double) (multiWrapLimit - curMulti) / (MaxMultiXactId / 2) * 100),
 					 errhint("To avoid MultiXactId assignment failures, execute a database-wide VACUUM in that database.\n"
 							 "You might also need to commit or roll back old prepared transactions.")));

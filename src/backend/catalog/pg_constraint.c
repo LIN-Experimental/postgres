@@ -46,6 +46,9 @@
  * from the constraint to the things it depends on.
  *
  * The new constraint's OID is returned.
+ *
+ * NB: Caller is responsible for ensuring the user has USAGE on all types
+ * conExpr depends on.
  */
 Oid
 CreateConstraintEntry(const char *constraintName,
@@ -118,7 +121,7 @@ CreateConstraintEntry(const char *constraintName,
 	{
 		Datum	   *conkey;
 
-		conkey = (Datum *) palloc(constraintNKeys * sizeof(Datum));
+		conkey = palloc_array(Datum, constraintNKeys);
 		for (i = 0; i < constraintNKeys; i++)
 			conkey[i] = Int16GetDatum(constraintKey[i]);
 		conkeyArray = construct_array_builtin(conkey, constraintNKeys, INT2OID);
@@ -131,7 +134,7 @@ CreateConstraintEntry(const char *constraintName,
 		Datum	   *fkdatums;
 		int			nkeys = Max(foreignNKeys, numFkDeleteSetCols);
 
-		fkdatums = (Datum *) palloc(nkeys * sizeof(Datum));
+		fkdatums = palloc_array(Datum, nkeys);
 		for (i = 0; i < foreignNKeys; i++)
 			fkdatums[i] = Int16GetDatum(foreignKey[i]);
 		confkeyArray = construct_array_builtin(fkdatums, foreignNKeys, INT2OID);
@@ -167,7 +170,7 @@ CreateConstraintEntry(const char *constraintName,
 	{
 		Datum	   *opdatums;
 
-		opdatums = (Datum *) palloc(constraintNKeys * sizeof(Datum));
+		opdatums = palloc_array(Datum, constraintNKeys);
 		for (i = 0; i < constraintNKeys; i++)
 			opdatums[i] = ObjectIdGetDatum(exclOp[i]);
 		conexclopArray = construct_array_builtin(opdatums, constraintNKeys, OIDOID);

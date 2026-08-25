@@ -87,6 +87,19 @@ typedef enum WalCompression
 	WAL_COMPRESSION_ZSTD,
 } WalCompression;
 
+/*
+ * Choose an appropriate default WAL compression method for wal_compression=on.
+ * Prefer zstd when compiled in; otherwise use lz4 if available, falling back
+ * to pglz.
+ */
+#if defined(USE_ZSTD)
+#define WAL_COMPRESSION_ON	WAL_COMPRESSION_ZSTD
+#elif defined(USE_LZ4)
+#define WAL_COMPRESSION_ON	WAL_COMPRESSION_LZ4
+#else
+#define WAL_COMPRESSION_ON	WAL_COMPRESSION_PGLZ
+#endif
+
 /* Recovery states */
 typedef enum RecoveryState
 {
@@ -249,6 +262,7 @@ extern uint64 GetSystemIdentifier(void);
 extern char *GetMockAuthenticationNonce(void);
 extern bool DataChecksumsNeedWrite(void);
 extern bool DataChecksumsNeedVerify(void);
+extern XLogRecPtr GetLastChecksumChangeRecPtr(void);
 extern bool DataChecksumsOn(void);
 extern bool DataChecksumsOff(void);
 extern bool DataChecksumsInProgressOn(void);

@@ -43,6 +43,22 @@ $node->command_fails(
 		'--start',
 	],
 	'no destination file');
+$node->command_fails_like(
+	[ 'pg_recvlogical', '--startpos' => '123456789/0' ],
+	qr/error: could not parse start position/,
+	'start position with first component wider than 32 bits');
+$node->command_fails_like(
+	[ 'pg_recvlogical', '--startpos' => '0x1/0' ],
+	qr/error: could not parse start position/,
+	'start position with 0x prefix');
+$node->command_fails_like(
+	[ 'pg_recvlogical', '--endpos' => '0/123456789' ],
+	qr/error: could not parse end position/,
+	'end position with second component wider than 32 bits');
+$node->command_fails_like(
+	[ 'pg_recvlogical', '--endpos' => '1/2/3' ],
+	qr/error: could not parse end position/,
+	'end position with trailing garbage');
 
 $node->command_ok(
 	[
@@ -198,6 +214,8 @@ my $recv = IPC::Run::start(
 # Wait for pg_recvlogical to receive and write the first INSERT
 my $first_ins = wait_for_file($outfile, qr/INSERT/);
 
+my $log_offset = -s $node->logfile;
+
 # Terminate the walsender to force pg_recvlogical to reconnect
 my $backend_pid = $node->safe_psql('postgres',
 	"SELECT active_pid FROM pg_replication_slots WHERE slot_name = 'reconnect_test'"
@@ -205,9 +223,8 @@ my $backend_pid = $node->safe_psql('postgres',
 $node->safe_psql('postgres', "SELECT pg_terminate_backend($backend_pid)");
 
 # Wait for pg_recvlogical to reconnect
-$node->poll_query_until('postgres',
-	"SELECT active_pid IS NOT NULL AND active_pid != $backend_pid FROM pg_replication_slots WHERE slot_name = 'reconnect_test'"
-) or die "Timed out while waiting for pg_recvlogical to reconnect";
+$node->wait_for_log(qr/acquired logical replication slot \"reconnect_test\"/,
+	$log_offset);
 
 # Insert the second record for this test
 $node->safe_psql('postgres', 'INSERT INTO test_table VALUES (2)');

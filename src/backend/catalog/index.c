@@ -728,6 +728,9 @@ UpdateIndexRelation(Oid indexoid,
  * constraintId: if not NULL, receives OID of created constraint
  *
  * Returns the OID of the created index.
+ *
+ * NB: Caller is responsible for ensuring the user has USAGE on all types
+ * indexInfo->ii_{Expressions,Predicate} depend on.
  */
 Oid
 index_create(Relation heapRelation,
@@ -2897,7 +2900,8 @@ index_update_stats(Relation rel,
 		{
 			StdRdOptions *options = (StdRdOptions *) rel->rd_options;
 
-			if (options != NULL && !options->autovacuum.enabled)
+			if (options != NULL &&
+				options->autovacuum.enabled == PG_TERNARY_FALSE)
 				update_stats = false;
 		}
 		else

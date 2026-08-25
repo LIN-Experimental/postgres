@@ -279,6 +279,7 @@ static void array_to_datum_internal(AV *av, ArrayBuildState **astatep,
 									int *ndims, int *dims, int cur_depth,
 									Oid elemtypid, int32 typmod,
 									FmgrInfo *finfo, Oid typioparam);
+static int	av_count_limit(AV *av);
 static Datum plperl_hash_to_datum(SV *src, TupleDesc td);
 
 static void plperl_init_shared_libs(pTHX);
@@ -287,7 +288,6 @@ static void plperl_untrusted_init(void);
 static HV  *plperl_spi_execute_fetch_result(SPITupleTable *tuptable,
 											uint64 processed, int status);
 static void plperl_return_next_internal(SV *sv);
-static char *hek2cstr(HE *he);
 static SV **hv_store_string(HV *hv, const char *key, SV *val);
 static SV **hv_fetch_string(HV *hv, const char *key);
 static void plperl_create_sub(plperl_proc_desc *prodesc, const char *s,
@@ -319,60 +319,6 @@ SvREFCNT_dec_current(SV *sv)
 	dTHX;
 
 	SvREFCNT_dec(sv);
-}
-
-/*
- * convert a HE (hash entry) key to a cstr in the current database encoding
- */
-static char *
-hek2cstr(HE *he)
-{
-	dTHX;
-	char	   *ret;
-	SV		   *sv;
-
-	/*
-	 * HeSVKEY_force will return a temporary mortal SV*, so we need to make
-	 * sure to free it with ENTER/SAVE/FREE/LEAVE
-	 */
-	ENTER;
-	SAVETMPS;
-
-	/*-------------------------
-	 * Unfortunately, while HeUTF8 is true for most things > 256, for values
-	 * 128..255 it's not, but perl will treat them as unicode code points if
-	 * the utf8 flag is not set ( see The "Unicode Bug" in perldoc perlunicode
-	 * for more)
-	 *
-	 * So if we did the expected:
-	 *	  if (HeUTF8(he))
-	 *		  utf_u2e(key...);
-	 *	  else // must be ascii
-	 *		  return HePV(he);
-	 * we won't match columns with codepoints from 128..255
-	 *
-	 * For a more concrete example given a column with the name of the unicode
-	 * codepoint U+00ae (registered sign) and a UTF8 database and the perl
-	 * return_next { "\N{U+00ae}=>'text } would always fail as heUTF8 returns
-	 * 0 and HePV() would give us a char * with 1 byte contains the decimal
-	 * value 174
-	 *
-	 * Perl has the brains to know when it should utf8 encode 174 properly, so
-	 * here we force it into an SV so that perl will figure it out and do the
-	 * right thing
-	 *-------------------------
-	 */
-
-	sv = HeSVKEY_force(he);
-	if (HeUTF8(he))
-		SvUTF8_on(sv);
-	ret = sv2cstr(sv);
-
-	/* free sv */
-	FREETMPS;
-	LEAVE;
-
-	return ret;
 }
 
 
@@ -1092,8 +1038,8 @@ plperl_build_tuple_result(HV *perlhash, TupleDesc td)
 	hv_iterinit(perlhash);
 	while ((he = hv_iternext(perlhash)))
 	{
-		SV		   *val = HeVAL(he);
 		char	   *key = hek2cstr(he);
+		SV		   *val = hv_iterval(perlhash, he);
 		int			attn = SPI_fnumber(td, key);
 		Form_pg_attribute attr;
 
@@ -1119,7 +1065,6 @@ plperl_build_tuple_result(HV *perlhash, TupleDesc td)
 
 		pfree(key);
 	}
-	hv_iterinit(perlhash);
 
 	tup = heap_form_tuple(td, values, nulls);
 	pfree(values);
@@ -1137,15 +1082,20 @@ plperl_hash_to_datum(SV *src, TupleDesc td)
 }
 
 /*
- * if we are an array ref return the reference. this is special in that if we
- * are a PostgreSQL::InServer::ARRAY object we will return the 'magic' array.
+ * If sv is an array ref return the reference, else return NULL.
+ *
+ * This is special in that if sv is a PostgreSQL::InServer::ARRAY object
+ * we will fetch its 'magic' array.
+ *
+ * The caller must already have invoked plperl_materialize_sv() on sv.
+ * sv may be NULL.
  */
 static SV  *
 get_perl_array_ref(SV *sv)
 {
 	dTHX;
 
-	if (SvOK(sv) && SvROK(sv))
+	if (sv && SvROK(sv))
 	{
 		if (SvTYPE(SvRV(sv)) == SVt_PVAV)
 			return sv;
@@ -1154,9 +1104,12 @@ get_perl_array_ref(SV *sv)
 			HV		   *hv = (HV *) SvRV(sv);
 			SV		  **sav = hv_fetch_string(hv, "array");
 
-			if (sav && *sav && SvOK(*sav) && SvROK(*sav) &&
-				SvTYPE(SvRV(*sav)) == SVt_PVAV)
-				return *sav;
+			if (sav && *sav)
+			{
+				plperl_materialize_sv(*sav);
+				if (SvROK(*sav) && SvTYPE(SvRV(*sav)) == SVt_PVAV)
+					return *sav;
+			}
 
 			elog(ERROR, "could not get array reference from PostgreSQL::InServer::ARRAY object");
 		}
@@ -1171,6 +1124,10 @@ get_perl_array_ref(SV *sv)
  * if we didn't do it like that, we'd need some other convention for knowing
  * whether we'd already found any scalars (and thus the number of dimensions
  * is frozen).
+ *
+ * Caller is required to have set dims[cur_depth - 1] to the length of the
+ * input array, i.e., av_count_limit(av).  We make this requirement so as to
+ * avoid reading av_count() twice, which is hazardous for tied arrays.
  */
 static void
 array_to_datum_internal(AV *av, ArrayBuildState **astatep,
@@ -1180,17 +1137,20 @@ array_to_datum_internal(AV *av, ArrayBuildState **astatep,
 {
 	dTHX;
 	int			i;
-	int			len = av_len(av) + 1;
+	int			len = dims[cur_depth - 1];
 
 	for (i = 0; i < len; i++)
 	{
 		/* fetch the array element */
 		SV		  **svp = av_fetch(av, i, FALSE);
+		SV		   *elem = svp ? *svp : NULL;
+		SV		   *sav;
 
-		/* see if this element is an array, if so get that */
-		SV		   *sav = svp ? get_perl_array_ref(*svp) : NULL;
+		/* cope with get magic on the array element */
+		plperl_materialize_sv(elem);
 
 		/* multi-dimensional array? */
+		sav = get_perl_array_ref(elem);
 		if (sav)
 		{
 			AV		   *nav = (AV *) SvRV(sav);
@@ -1210,11 +1170,11 @@ array_to_datum_internal(AV *av, ArrayBuildState **astatep,
 							 errmsg("number of array dimensions exceeds the maximum allowed (%d)",
 									MAXDIM)));
 				/* OK, add a dimension */
-				dims[*ndims] = av_len(nav) + 1;
+				dims[*ndims] = av_count_limit(nav);
 				(*ndims)++;
 			}
 			else if (cur_depth >= *ndims ||
-					 av_len(nav) + 1 != dims[cur_depth])
+					 av_count_limit(nav) != dims[cur_depth])
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 						 errmsg("multidimensional arrays must have array expressions with matching dimensions")));
@@ -1236,7 +1196,7 @@ array_to_datum_internal(AV *av, ArrayBuildState **astatep,
 						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 						 errmsg("multidimensional arrays must have array expressions with matching dimensions")));
 
-			dat = plperl_sv_to_datum(svp ? *svp : NULL,
+			dat = plperl_sv_to_datum(elem,
 									 elemtypid,
 									 typmod,
 									 NULL,
@@ -1254,6 +1214,25 @@ array_to_datum_internal(AV *av, ArrayBuildState **astatep,
 									elemtypid, CurrentMemoryContext);
 		}
 	}
+}
+
+/*
+ * av_count returns Size_t, so at least in theory it could overrun INT_MAX.
+ * As long as we have to check, let's throw error for anything above
+ * MaxArraySize, which will surely fail later.
+ */
+static int
+av_count_limit(AV *av)
+{
+	dTHX;
+	Size_t		cnt = av_count(av);
+
+	if (cnt > MaxArraySize)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("array size exceeds the maximum allowed (%zu)",
+						MaxArraySize)));
+	return (int) cnt;
 }
 
 /*
@@ -1283,7 +1262,7 @@ plperl_array_to_datum(SV *src, Oid typid, int32 typmod)
 	_sv_to_datum_finfo(elemtypid, &finfo, &typioparam);
 
 	memset(dims, 0, sizeof(dims));
-	dims[0] = av_len(nav) + 1;
+	dims[0] = av_count_limit(nav);
 
 	array_to_datum_internal(nav, &astate,
 							&ndims, dims, 1,
@@ -1331,6 +1310,7 @@ plperl_sv_to_datum(SV *sv, Oid typid, int32 typmod,
 				   FmgrInfo *finfo, Oid typioparam,
 				   bool *isnull)
 {
+	dTHX;
 	FmgrInfo	tmp;
 	Oid			funcid;
 
@@ -1338,6 +1318,8 @@ plperl_sv_to_datum(SV *sv, Oid typid, int32 typmod,
 	check_stack_depth();
 
 	*isnull = false;
+
+	plperl_materialize_sv(sv);
 
 	/*
 	 * Return NULL if result is undef, or if we're in a function returning
@@ -1783,7 +1765,8 @@ plperl_modify_tuple(HV *hvTD, TriggerData *tdata, HeapTuple otup)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_COLUMN),
 				 errmsg("$_TD->{new} does not exist")));
-	if (!SvOK(*svp) || !SvROK(*svp) || SvTYPE(SvRV(*svp)) != SVt_PVHV)
+	plperl_materialize_sv(*svp);
+	if (!(*svp) || !SvROK(*svp) || SvTYPE(SvRV(*svp)) != SVt_PVHV)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
 				 errmsg("$_TD->{new} is not a hash reference")));
@@ -1792,15 +1775,15 @@ plperl_modify_tuple(HV *hvTD, TriggerData *tdata, HeapTuple otup)
 	tupdesc = tdata->tg_relation->rd_att;
 	natts = tupdesc->natts;
 
-	modvalues = (Datum *) palloc0(natts * sizeof(Datum));
-	modnulls = (bool *) palloc0(natts * sizeof(bool));
-	modrepls = (bool *) palloc0(natts * sizeof(bool));
+	modvalues = palloc0_array(Datum, natts);
+	modnulls = palloc0_array(bool, natts);
+	modrepls = palloc0_array(bool, natts);
 
 	hv_iterinit(hvNew);
 	while ((he = hv_iternext(hvNew)))
 	{
 		char	   *key = hek2cstr(he);
-		SV		   *val = HeVAL(he);
+		SV		   *val = hv_iterval(hvNew, he);
 		int			attn = SPI_fnumber(tupdesc, key);
 		Form_pg_attribute attr;
 
@@ -1833,7 +1816,6 @@ plperl_modify_tuple(HV *hvTD, TriggerData *tdata, HeapTuple otup)
 
 		pfree(key);
 	}
-	hv_iterinit(hvNew);
 
 	rtup = heap_modify_tuple(otup, tupdesc, modvalues, modnulls, modrepls);
 
@@ -2462,6 +2444,7 @@ plperl_func_handler(PG_FUNCTION_ARGS)
 
 	if (prodesc->fn_retisset)
 	{
+		dTHX;
 		SV		   *sav;
 
 		/*
@@ -2470,21 +2453,22 @@ plperl_func_handler(PG_FUNCTION_ARGS)
 		 * SRFs that didn't know about return_next(). Any other sort of return
 		 * value is an error, except undef which means return an empty set.
 		 */
+		plperl_materialize_sv(perlret);
 		sav = get_perl_array_ref(perlret);
 		if (sav)
 		{
-			dTHX;
-			int			i = 0;
-			SV		  **svp = 0;
 			AV		   *rav = (AV *) SvRV(sav);
+			Size_t		alen = av_count(rav);
 
-			while ((svp = av_fetch(rav, i, FALSE)) != NULL)
+			for (Size_t i = 0; i < alen; i++)
 			{
-				plperl_return_next_internal(*svp);
-				i++;
+				SV		  **svp = av_fetch(rav, i, FALSE);
+
+				if (svp)
+					plperl_return_next_internal(*svp);
 			}
 		}
-		else if (SvOK(perlret))
+		else if (perlret && SvOK(perlret))
 		{
 			ereport(ERROR,
 					(errcode(ERRCODE_DATATYPE_MISMATCH),
@@ -2526,6 +2510,7 @@ plperl_func_handler(PG_FUNCTION_ARGS)
 static Datum
 plperl_trigger_handler(PG_FUNCTION_ARGS)
 {
+	dTHX;
 	plperl_proc_desc *prodesc;
 	SV		   *perlret;
 	Datum		retval;
@@ -2568,6 +2553,8 @@ plperl_trigger_handler(PG_FUNCTION_ARGS)
 	************************************************************/
 	if (SPI_finish() != SPI_OK_FINISH)
 		elog(ERROR, "SPI_finish() failed");
+
+	plperl_materialize_sv(perlret);
 
 	if (perlret == NULL || !SvOK(perlret))
 	{
@@ -2811,9 +2798,9 @@ compile_plperl_function(Oid fn_oid, bool is_trigger, bool is_event_trigger)
 		prodesc->fn_xmin = HeapTupleHeaderGetRawXmin(procTup->t_data);
 		prodesc->fn_tid = procTup->t_self;
 		prodesc->nargs = procStruct->pronargs;
-		prodesc->arg_out_func = (FmgrInfo *) palloc0(prodesc->nargs * sizeof(FmgrInfo));
-		prodesc->arg_is_rowtype = (bool *) palloc0(prodesc->nargs * sizeof(bool));
-		prodesc->arg_arraytype = (Oid *) palloc0(prodesc->nargs * sizeof(Oid));
+		prodesc->arg_out_func = palloc0_array(FmgrInfo, prodesc->nargs);
+		prodesc->arg_is_rowtype = palloc0_array(bool, prodesc->nargs);
+		prodesc->arg_arraytype = palloc0_array(Oid, prodesc->nargs);
 		MemoryContextSwitchTo(oldcontext);
 
 		/* Remember if function is STABLE/IMMUTABLE */
@@ -3365,9 +3352,11 @@ plperl_return_next_internal(SV *sv)
 
 	if (prodesc->fn_retistuple)
 	{
+		dTHX;
 		HeapTuple	tuple;
 
-		if (!(SvOK(sv) && SvROK(sv) && SvTYPE(SvRV(sv)) == SVt_PVHV))
+		plperl_materialize_sv(sv);
+		if (!(SvROK(sv) && SvTYPE(SvRV(sv)) == SVt_PVHV))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATATYPE_MISMATCH),
 					 errmsg("SETOF-composite-returning PL/Perl function "
@@ -3606,9 +3595,9 @@ plperl_spi_prepare(char *query, int argc, SV **argv)
 		snprintf(qdesc->qname, sizeof(qdesc->qname), "%p", qdesc);
 		qdesc->plan_cxt = plan_cxt;
 		qdesc->nargs = argc;
-		qdesc->argtypes = (Oid *) palloc(argc * sizeof(Oid));
-		qdesc->arginfuncs = (FmgrInfo *) palloc(argc * sizeof(FmgrInfo));
-		qdesc->argtypioparams = (Oid *) palloc(argc * sizeof(Oid));
+		qdesc->argtypes = palloc_array(Oid, argc);
+		qdesc->arginfuncs = palloc_array(FmgrInfo, argc);
+		qdesc->argtypioparams = palloc_array(Oid, argc);
 		MemoryContextSwitchTo(oldcontext);
 
 		/************************************************************
@@ -3779,8 +3768,8 @@ plperl_spi_exec_prepared(char *query, HV *attr, int argc, SV **argv)
 		 ************************************************************/
 		if (argc > 0)
 		{
-			nulls = (char *) palloc(argc);
-			argvalues = (Datum *) palloc(argc * sizeof(Datum));
+			nulls = palloc_array(char, argc);
+			argvalues = palloc_array(Datum, argc);
 		}
 		else
 		{
@@ -3892,8 +3881,8 @@ plperl_spi_query_prepared(char *query, int argc, SV **argv)
 		 ************************************************************/
 		if (argc > 0)
 		{
-			nulls = (char *) palloc(argc);
-			argvalues = (Datum *) palloc(argc * sizeof(Datum));
+			nulls = palloc_array(char, argc);
+			argvalues = palloc_array(Datum, argc);
 		}
 		else
 		{

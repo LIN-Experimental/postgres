@@ -3604,6 +3604,45 @@ ERROR:  insert or update on table "fp_fk_defer" violates foreign key constraint 
 DETAIL:  Key (a)=(3) is not present in table "fp_pk_defer".
 COMMIT;
 DROP TABLE fp_pk_defer, fp_fk_defer;
+-- A deferred FK check queued while firing deferred triggers at commit must
+-- not be lost.  The RI fast-path flush runs during the deferred firing loop
+-- and can run user cast/equality code whose DML queues a further deferred
+-- check; that check must still fire.  fk_defer_main's deferred fast-path check
+-- runs a cast whose function inserts a violating row into fk_defer_t2,
+-- queueing fk_defer_t2's own deferred check, which must still be reported.
+CREATE TABLE fk_defer_t2_pk (id int PRIMARY KEY);
+CREATE TABLE fk_defer_t2 (a int REFERENCES fk_defer_t2_pk(id)
+    DEFERRABLE INITIALLY DEFERRED);
+CREATE TYPE fk_defer_vch AS (v int);
+CREATE FUNCTION fk_defer_cast(fk_defer_vch) RETURNS int
+    LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO fk_defer_t2 VALUES (999);   -- 999 absent, queues deferred check
+    RETURN $1.v;
+END$$;
+CREATE CAST (fk_defer_vch AS int) WITH FUNCTION fk_defer_cast(fk_defer_vch)
+    AS IMPLICIT;
+CREATE TABLE fk_defer_main_pk (id int PRIMARY KEY);
+INSERT INTO fk_defer_main_pk VALUES (1);
+CREATE TABLE fk_defer_main (a fk_defer_vch REFERENCES fk_defer_main_pk(id)
+    DEFERRABLE INITIALLY DEFERRED);
+-- At COMMIT the queued fk_defer_t2 check must fire and report the violation,
+-- rather than being dropped (which would let the dangling row commit).
+BEGIN;
+INSERT INTO fk_defer_main VALUES (row(1)::fk_defer_vch);
+COMMIT;   -- expected: ERROR on fk_defer_t2_a_fkey
+ERROR:  insert or update on table "fk_defer_t2" violates foreign key constraint "fk_defer_t2_a_fkey"
+DETAIL:  Key (a)=(999) is not present in table "fk_defer_t2_pk".
+-- The queued check must fire at transaction end, not early: making the
+-- referenced row present in the same transaction lets the commit succeed.
+INSERT INTO fk_defer_t2_pk VALUES (999);
+BEGIN;
+INSERT INTO fk_defer_main VALUES (row(1)::fk_defer_vch);
+COMMIT;   -- expected: success
+DROP TABLE fk_defer_main, fk_defer_main_pk, fk_defer_t2, fk_defer_t2_pk;
+DROP CAST (fk_defer_vch AS int);
+DROP FUNCTION fk_defer_cast(fk_defer_vch);
+DROP TYPE fk_defer_vch;
 -- Subtransaction abort: cached state must be invalidated on ROLLBACK TO
 CREATE TABLE fp_pk_subxact (a int PRIMARY KEY);
 CREATE TABLE fp_fk_subxact (a int REFERENCES fp_pk_subxact);
@@ -3807,3 +3846,270 @@ DETAIL:  Key (a)=(999) is not present in table "fp_subxact_pk".
 DROP TRIGGER fp_subxact_trg ON fp_subxact_fk;
 DROP FUNCTION fp_abort_subxact();
 DROP TABLE fp_subxact_fk, fp_subxact_pk;
+--
+-- Cache invalidation arriving in the middle of a fast-path batch flush.
+--
+-- A cross-type foreign key runs the user's cast function once per key per
+-- buffered row, inside ri_FastPathFlushLoop().  A cast that performs DDL
+-- raises an invalidation there, which detaches the constraint's fast-path
+-- metadata while the flush is still using it.
+--
+CREATE TYPE fkint;
+CREATE FUNCTION fkint_in(cstring) RETURNS fkint
+  AS 'int4in' LANGUAGE internal IMMUTABLE STRICT;
+NOTICE:  return type fkint is only a shell
+CREATE FUNCTION fkint_out(fkint) RETURNS cstring
+  AS 'int4out' LANGUAGE internal IMMUTABLE STRICT;
+NOTICE:  argument type fkint is only a shell
+LINE 1: CREATE FUNCTION fkint_out(fkint) RETURNS cstring
+                                  ^
+CREATE TYPE fkint (INPUT = fkint_in, OUTPUT = fkint_out, LIKE = int4);
+-- Renames the constraint the first time it is called, and so raises an
+-- invalidation partway through the flush.  Guarded on the catalog so the
+-- second and later calls are no-ops.
+CREATE FUNCTION fkint_to_int4(fkint) RETURNS int4 AS $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint
+                WHERE conrelid = 'fktable_inval'::regclass
+                  AND conname = 'fktable_inval_fk') THEN
+        EXECUTE 'ALTER TABLE fktable_inval'
+                ' RENAME CONSTRAINT fktable_inval_fk TO fktable_inval_fk2';
+    END IF;
+    RETURN format('%s', $1)::int4;
+END $$ LANGUAGE plpgsql;
+CREATE CAST (fkint AS int4) WITH FUNCTION fkint_to_int4(fkint) AS IMPLICIT;
+CREATE TABLE pktable_inval (a int4, b int4, PRIMARY KEY (a, b));
+INSERT INTO pktable_inval VALUES (1, 1), (2, 2);
+-- Multi-column FK, so the flush takes the per-row loop rather than the
+-- array path; cross-type on column a, so the cast above is invoked.
+CREATE TABLE fktable_inval (a fkint, b int4,
+  CONSTRAINT fktable_inval_fk FOREIGN KEY (a, b)
+    REFERENCES pktable_inval (a, b));
+-- More than one row, so the flush is still running after the invalidation.
+INSERT INTO fktable_inval VALUES ('1', 1), ('2', 2);
+-- Confirms the cast actually ran and raised the invalidation.  Without this
+-- the insert above could pass merely by not exercising the path at all.
+SELECT conname FROM pg_constraint
+  WHERE conrelid = 'fktable_inval'::regclass AND contype = 'f';
+      conname      
+-------------------
+ fktable_inval_fk2
+(1 row)
+
+SELECT count(*) FROM fktable_inval;
+ count 
+-------
+     2
+(1 row)
+
+DROP TABLE fktable_inval;
+DROP TABLE pktable_inval;
+DROP CAST (fkint AS int4);
+DROP FUNCTION fkint_to_int4(fkint);
+DROP TYPE fkint CASCADE;
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to function fkint_in(cstring)
+drop cascades to function fkint_out(fkint)
+-- Stranded firing state must not misroute ALTER TABLE ... ADD FOREIGN KEY
+-- validation into the batched fast path.  A caught FK-check error inside a
+-- subtransaction leaves firing_depth set (its decrement is skipped); a
+-- following ALTER whose validation runs per-row (forced here by RLS on the
+-- referenced table, so RI_Initial_Check() bails) would then be wrongly treated
+-- as running inside trigger firing, batched, and never flushed (a utility
+-- command has no AfterTriggerEndQuery), silently validating a violating row.
+CREATE ROLE regress_fpav_role;
+CREATE TABLE fpav_pk (id int PRIMARY KEY);
+INSERT INTO fpav_pk VALUES (1);
+ALTER TABLE fpav_pk ENABLE ROW LEVEL SECURITY;
+CREATE POLICY fpav_pk_all ON fpav_pk FOR ALL USING (true) WITH CHECK (true);
+GRANT REFERENCES, SELECT ON fpav_pk TO regress_fpav_role;
+CREATE TABLE fpav_fk (a int);
+INSERT INTO fpav_fk VALUES (1), (99);
+ALTER TABLE fpav_fk OWNER TO regress_fpav_role;
+CREATE TABLE fpav_cv_pk (id int PRIMARY KEY);
+INSERT INTO fpav_cv_pk VALUES (1);
+CREATE TABLE fpav_cv_fk (a int REFERENCES fpav_cv_pk(id));
+GRANT INSERT ON fpav_cv_fk TO regress_fpav_role;
+GRANT SELECT, INSERT ON fpav_cv_pk TO regress_fpav_role;
+SET ROLE regress_fpav_role;
+BEGIN;
+-- Caught FK violation: leaves firing_depth set if it is not restored.
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO fpav_cv_fk VALUES (999);
+    EXCEPTION WHEN foreign_key_violation THEN
+        NULL;
+    END;
+END$$;
+-- Must ERROR on the violating row (99), not silently validate it.
+ALTER TABLE fpav_fk ADD CONSTRAINT fpav_fk_fkey
+    FOREIGN KEY (a) REFERENCES fpav_pk (id);
+ERROR:  insert or update on table "fpav_fk" violates foreign key constraint "fpav_fk_fkey"
+DETAIL:  Key (a)=(99) is not present in table "fpav_pk".
+ROLLBACK;
+RESET ROLE;
+DROP TABLE fpav_fk, fpav_pk, fpav_cv_fk, fpav_cv_pk;
+DROP ROLE regress_fpav_role;
+-- Re-entrant fast-path check inside a committing subtransaction.  An AFTER
+-- trigger on one FK table runs FK DML on a second FK table inside a PL/pgSQL
+-- BEGIN ... EXCEPTION block, so the inner check batches in its own
+-- trigger-firing cycle nested in the outer check's.  The inner cycle must
+-- register its own end-of-batch callback and flush -- otherwise its FK check
+-- is skipped (an orphan commits) and its relations leak.
+CREATE TABLE fp_inner_pk (id int PRIMARY KEY);
+INSERT INTO fp_inner_pk VALUES (1);
+CREATE TABLE fp_inner_fk (a int REFERENCES fp_inner_pk (id));
+CREATE TABLE fp_outer_pk (id int PRIMARY KEY);
+INSERT INTO fp_outer_pk SELECT g FROM generate_series(1, 64) g;
+CREATE FUNCTION fp_reentry_subxact() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.a = 32 THEN
+        BEGIN
+            INSERT INTO fp_inner_fk VALUES (999);  -- violates; must be caught
+        EXCEPTION WHEN foreign_key_violation THEN
+            NULL;
+        END;
+    END IF;
+    RETURN NEW;
+END$$;
+CREATE TABLE fp_outer_fk (a int REFERENCES fp_outer_pk (id));
+CREATE TRIGGER fp_reentry_subxact_trg AFTER INSERT ON fp_outer_fk
+    FOR EACH ROW EXECUTE FUNCTION fp_reentry_subxact();
+INSERT INTO fp_outer_fk SELECT g FROM generate_series(1, 64) g;
+SELECT count(*) AS outer_rows FROM fp_outer_fk;   -- 64, outer batch intact
+ outer_rows 
+------------
+         64
+(1 row)
+
+SELECT count(*) AS inner_rows FROM fp_inner_fk;   -- 0, inner check caught
+ inner_rows 
+------------
+          0
+(1 row)
+
+DROP TRIGGER fp_reentry_subxact_trg ON fp_outer_fk;
+DROP FUNCTION fp_reentry_subxact();
+DROP TABLE fp_outer_fk, fp_outer_pk, fp_inner_fk, fp_inner_pk;
+-- A nested trigger-firing cycle that checks the same constraint must use a
+-- separate cache entry.  The inner violation is caught by its subtransaction,
+-- while the valid outer row remains buffered and is checked normally.
+CREATE TABLE fp_same_pk (id int PRIMARY KEY);
+INSERT INTO fp_same_pk VALUES (1);
+CREATE TABLE fp_same_fk (a int REFERENCES fp_same_pk (id));
+CREATE FUNCTION fp_reentry_same_constraint() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.a = 1 THEN
+        BEGIN
+            INSERT INTO fp_same_fk VALUES (999);
+        EXCEPTION WHEN foreign_key_violation THEN
+            NULL;
+        END;
+    END IF;
+    RETURN NEW;
+END$$;
+CREATE TRIGGER fp_reentry_same_constraint_trg AFTER INSERT ON fp_same_fk
+    FOR EACH ROW EXECUTE FUNCTION fp_reentry_same_constraint();
+INSERT INTO fp_same_fk VALUES (1);
+SELECT * FROM fp_same_fk;
+ a 
+---
+ 1
+(1 row)
+
+DROP TRIGGER fp_reentry_same_constraint_trg ON fp_same_fk;
+DROP FUNCTION fp_reentry_same_constraint();
+DROP TABLE fp_same_fk, fp_same_pk;
+-- An AFTER trigger runs a query of its own, and that query inserts into a
+-- second table with a fast-path foreign key.  The entry the nested INSERT
+-- creates belongs to the cursor's portal, which is gone by the time the
+-- entry is torn down at the end of the outer statement.  Every key stored
+-- below is present in its referenced table, so the INSERT must just succeed.
+CREATE TABLE fp_customer (id int PRIMARY KEY);
+INSERT INTO fp_customer VALUES (1);
+CREATE TABLE fp_product (id int PRIMARY KEY);
+INSERT INTO fp_product SELECT generate_series(1, 4);
+CREATE TABLE fp_kit_component (kit_product_id int, component_product_id int);
+INSERT INTO fp_kit_component VALUES (1, 2), (1, 3), (1, 4);
+CREATE TABLE fp_order (id int, customer_id int REFERENCES fp_customer,
+    product_id int);
+CREATE TABLE fp_order_item (order_id int, product_id int
+    REFERENCES fp_product);
+CREATE FUNCTION fp_add_order_item(order_id int, product_id int) RETURNS int
+    LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO fp_order_item VALUES (order_id, product_id);
+    RETURN product_id;
+END$$;
+CREATE FUNCTION fp_expand_kit() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    component_id int;
+    ncomponents int := 0;
+BEGIN
+    FOR component_id IN
+        SELECT fp_add_order_item(NEW.id, component_product_id)
+            FROM fp_kit_component WHERE kit_product_id = NEW.product_id
+    LOOP
+        ncomponents := ncomponents + 1;
+    END LOOP;
+    RAISE NOTICE 'order % expanded into % order items', NEW.id, ncomponents;
+    RETURN NULL;
+END$$;
+CREATE TRIGGER fp_expand_kit_trg AFTER INSERT ON fp_order
+    FOR EACH ROW EXECUTE FUNCTION fp_expand_kit();
+INSERT INTO fp_order VALUES (1, 1, 1);
+NOTICE:  order 1 expanded into 3 order items
+SELECT count(*) FROM fp_order_item;
+ count 
+-------
+     3
+(1 row)
+
+DROP TABLE fp_order, fp_order_item, fp_kit_component, fp_product, fp_customer;
+DROP FUNCTION fp_expand_kit(), fp_add_order_item(int, int);
+-- Nested firing of the same constraint must use an entry for its own query
+-- depth.  The RAISE is reached if the nested violation remains buffered for
+-- the outer cycle's callback.
+CREATE TABLE fp_depth_pk (id int PRIMARY KEY);
+INSERT INTO fp_depth_pk VALUES (1);
+CREATE TABLE fp_depth_fk (a int REFERENCES fp_depth_pk);
+CREATE FUNCTION fp_depth_reentry() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.a = 1 THEN
+        INSERT INTO fp_depth_fk VALUES (999);
+        RAISE EXCEPTION 'nested FK check was not flushed';
+    END IF;
+    RETURN NEW;
+END$$;
+-- Sort after the RI trigger, so the outer row has already been batched.
+CREATE TRIGGER zz_fp_depth_reentry AFTER INSERT ON fp_depth_fk
+    FOR EACH ROW EXECUTE FUNCTION fp_depth_reentry();
+INSERT INTO fp_depth_fk VALUES (1);
+ERROR:  insert or update on table "fp_depth_fk" violates foreign key constraint "fp_depth_fk_a_fkey"
+DETAIL:  Key (a)=(999) is not present in table "fp_depth_pk".
+CONTEXT:  SQL statement "INSERT INTO fp_depth_fk VALUES (999)"
+PL/pgSQL function fp_depth_reentry() line 4 at SQL statement
+SELECT * FROM fp_depth_fk;
+ a 
+---
+(0 rows)
+
+DROP TABLE fp_depth_fk, fp_depth_pk;
+DROP FUNCTION fp_depth_reentry();
+-- Deferred FK check fires at commit (query depth -1); its batch must still get
+-- a callback registered and flushed.
+CREATE TABLE fp_deferred_pk (id int PRIMARY KEY);
+CREATE TABLE fp_deferred_fk (a int REFERENCES fp_deferred_pk (id)
+    DEFERRABLE INITIALLY DEFERRED);
+BEGIN;
+INSERT INTO fp_deferred_fk VALUES (1);
+INSERT INTO fp_deferred_pk VALUES (1);
+COMMIT;
+SELECT count(*) AS deferred_rows FROM fp_deferred_fk;  -- 1, check passed at commit
+ deferred_rows 
+---------------
+             1
+(1 row)
+
+DROP TABLE fp_deferred_fk, fp_deferred_pk;

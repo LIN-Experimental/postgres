@@ -1153,9 +1153,9 @@ text_position_next_internal(char *start_ptr, TextPositionState *state)
 	int			needle_len = state->len2;
 	int			skiptablemask = state->skiptablemask;
 	const char *haystack = state->str1;
-	const char *needle = state->str2;
+	char	   *needle = state->str2;
 	const char *haystack_end = &haystack[haystack_len];
-	const char *hptr;
+	char	   *hptr;
 
 	Assert(start_ptr >= haystack && start_ptr <= haystack_end);
 	Assert(needle_len > 0);
@@ -1184,7 +1184,7 @@ text_position_next_internal(char *start_ptr, TextPositionState *state)
 		 * collation would accept an empty match, returning one would send
 		 * callers that search for successive matches into an infinite loop.)
 		 */
-		const char *result_hptr = NULL;
+		char	   *result_hptr = NULL;
 
 		hptr = start_ptr;
 		while (hptr < haystack_end)
@@ -1198,7 +1198,7 @@ text_position_next_internal(char *start_ptr, TextPositionState *state)
 			if (!state->greedy &&
 				haystack_end - hptr >= needle_len &&
 				pg_strncoll(hptr, needle_len, needle, needle_len, state->locale) == 0)
-				return (char *) hptr;
+				return hptr;
 
 			/*
 			 * Else check if any of the non-empty substrings starting at hptr
@@ -1223,7 +1223,7 @@ text_position_next_internal(char *start_ptr, TextPositionState *state)
 			hptr += pg_mblen_range(hptr, haystack_end);
 		}
 
-		return (char *) result_hptr;
+		return result_hptr;
 	}
 	else if (needle_len == 1)
 	{
@@ -1234,21 +1234,21 @@ text_position_next_internal(char *start_ptr, TextPositionState *state)
 		while (hptr < haystack_end)
 		{
 			if (*hptr == nchar)
-				return (char *) hptr;
+				return hptr;
 			hptr++;
 		}
 	}
 	else
 	{
-		const char *needle_last = &needle[needle_len - 1];
+		char	   *needle_last = &needle[needle_len - 1];
 
 		/* Start at startpos plus the length of the needle */
 		hptr = start_ptr + needle_len - 1;
 		while (hptr < haystack_end)
 		{
 			/* Match the needle scanning *backward* */
-			const char *nptr;
-			const char *p;
+			char	   *nptr;
+			char	   *p;
 
 			nptr = needle_last;
 			p = hptr;
@@ -1256,7 +1256,7 @@ text_position_next_internal(char *start_ptr, TextPositionState *state)
 			{
 				/* Matched it all?	If so, return 1-based position */
 				if (nptr == needle)
-					return (char *) p;
+					return p;
 				nptr--, p--;
 			}
 
@@ -1794,7 +1794,7 @@ varstr_sortsupport(SortSupport ssup, Oid typid, Oid collid)
 			initHyperLogLog(&sss->abbr_card, 10);
 			initHyperLogLog(&sss->full_card, 10);
 			ssup->abbrev_full_comparator = ssup->comparator;
-			ssup->comparator = ssup_datum_unsigned_cmp;
+			ssup->comparator = ssup_datum_uint64_cmp;
 			ssup->abbrev_converter = varstr_abbrev_convert;
 			ssup->abbrev_abort = varstr_abbrev_abort;
 		}
@@ -2179,7 +2179,7 @@ done:
 	/*
 	 * Byteswap on little-endian machines.
 	 *
-	 * This is needed so that ssup_datum_unsigned_cmp() (an unsigned integer
+	 * This is needed so that ssup_datum_uint64_cmp() (an unsigned integer
 	 * 3-way comparator) works correctly on all platforms.  If we didn't do
 	 * this, the comparator would have to call memcmp() with a pair of
 	 * pointers to the first byte of each abbreviated key, which is slower.
@@ -3044,7 +3044,7 @@ SplitDirectoriesString(char *rawstring, char separator,
  * However, it's not clear that having one function with a bunch of option
  * flags would be much better.
  *
- * XXX there is a version of this function in src/bin/pg_dump/dumputils.c.
+ * XXX there is a version of this function in src/fe_utils/string_utils.c.
  * Be sure to update that if you have to change this.
  *
  * Inputs:
@@ -4470,7 +4470,7 @@ string_agg_deserialize(PG_FUNCTION_ARGS)
 	bytea	   *sstate;
 	StringInfo	result;
 	StringInfoData buf;
-	char	   *data;
+	const char *data;
 	int			datalen;
 
 	/* cannot be called directly because of internal-type argument */
@@ -4492,7 +4492,7 @@ string_agg_deserialize(PG_FUNCTION_ARGS)
 
 	/* data */
 	datalen = VARSIZE_ANY_EXHDR(sstate) - 4;
-	data = (char *) pq_getmsgbytes(&buf, datalen);
+	data = pq_getmsgbytes(&buf, datalen);
 	appendBinaryStringInfo(result, data, datalen);
 
 	pq_getmsgend(&buf);
@@ -5304,6 +5304,20 @@ rest_of_char_same(const char *s1, const char *s2, int len)
 			return false;
 	}
 	return true;
+}
+
+/*
+ * Helper function for checking return value of Levenshtein distance functions.
+ * We calculate it as an int64, but the distance functions return an int32.
+ */
+static inline int
+levenshtein_result(int64 res)
+{
+	if (unlikely(res < PG_INT32_MIN || res > PG_INT32_MAX))
+		ereport(ERROR,
+				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				 errmsg("levenshtein distance out of range")));
+	return res;
 }
 
 /* Expand each Levenshtein distance variant */

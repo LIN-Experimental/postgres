@@ -1767,7 +1767,6 @@ MemoizeInstrumentation
 MemoizeKey
 MemoizePath
 MemoizeState
-MemoizeTuple
 MemoryChunk
 MemoryContext
 MemoryContextCallback
@@ -2331,6 +2330,7 @@ PgStatShared_CustomVarEntry
 PgStatShared_Database
 PgStatShared_Function
 PgStatShared_HashEntry
+PgStatShared_Index
 PgStatShared_IO
 PgStatShared_Lock
 PgStatShared_Relation
@@ -2353,6 +2353,7 @@ PgStat_FunctionCallUsage
 PgStat_FunctionCounts
 PgStat_HashKey
 PgStat_IO
+PgStat_IndexCounts
 PgStat_KindInfo
 PgStat_LocalState
 PgStat_Lock
@@ -2360,6 +2361,7 @@ PgStat_LockEntry
 PgStat_PendingDroppedStatsItem
 PgStat_PendingIO
 PgStat_PendingLock
+PgStat_RelationStatus
 PgStat_SLRUStats
 PgStat_ShmemControl
 PgStat_Snapshot
@@ -2368,13 +2370,13 @@ PgStat_StatCustomFixedEntry
 PgStat_StatCustomVarEntry
 PgStat_StatDBEntry
 PgStat_StatFuncEntry
+PgStat_StatIdxEntry
 PgStat_StatReplSlotEntry
 PgStat_StatSubEntry
 PgStat_StatTabEntry
 PgStat_StatsFileOp
 PgStat_SubXactStatus
 PgStat_TableCounts
-PgStat_TableStatus
 PgStat_TableXactStatus
 PgStat_WalCounters
 PgStat_WalStats
@@ -2472,6 +2474,7 @@ PsqlScanQuoteType
 PsqlScanResult
 PsqlScanState
 PsqlScanStateData
+PsqlScanStateSave
 PsqlSettings
 Publication
 PublicationActions
@@ -2532,6 +2535,7 @@ RI_CompareHashEntry
 RI_CompareKey
 RI_ConstraintInfo
 RI_FastPathEntry
+RI_FastPathKey
 RI_QueryHashEntry
 RI_QueryKey
 RTEKind
@@ -2570,6 +2574,7 @@ ReadBytePtrType
 ReadExtraTocPtrType
 ReadFunc
 ReadLocalXLogPageNoWaitPrivate
+ReadNodeContext
 ReadReplicationSlotCmd
 ReadStream
 ReadStreamBlockNumberCB
@@ -2708,6 +2713,8 @@ ResultState
 ResultType
 RetainDeadTuplesData
 RetainDeadTuplesPhase
+RetrievedObject
+RetrievedObjects
 ReturnSetInfo
 ReturnStmt
 ReturningClause

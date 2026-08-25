@@ -23,7 +23,6 @@
 #include "catalog/objectaccess.h"
 #include "catalog/pg_type.h"
 #include "executor/execExpr.h"
-#include "executor/execdebug.h"
 #include "executor/nodeAgg.h"
 #include "executor/nodeSubplan.h"
 #include "funcapi.h"
@@ -700,8 +699,7 @@ llvm_compile_expr(ExprState *state)
 						LLVMBuildStore(b, l_sbool_const(1), v_resnullp);
 
 						/* create blocks for checking args, one for each */
-						b_checkargnulls = (LLVMBasicBlockRef *)
-							palloc(sizeof(LLVMBasicBlockRef) * op->d.func.nargs);
+						b_checkargnulls = palloc_array(LLVMBasicBlockRef, op->d.func.nargs);
 						for (int argno = 0; argno < op->d.func.nargs; argno++)
 							b_checkargnulls[argno] =
 								l_bb_before_v(b_nonull, "b.%d.isnull.%d", opno,
@@ -2111,11 +2109,12 @@ llvm_compile_expr(ExprState *state)
 						LLVMPositionBuilderAtEnd(b, b_ifnullblock);
 
 						/*
-						 * In strict node, NULL inputs result in NULL.  Save
-						 * the NULL result and goto jumpdone.
+						 * In strict mode, NULL inputs result in NULL.  Save
+						 * the NULL to the ExprState's resnull/resvalue fields
+						 * directly, then goto jumpdone.
 						 */
-						LLVMBuildStore(b, l_sbool_const(1), v_resnullp);
-						LLVMBuildStore(b, l_datum_const(0), v_resvaluep);
+						LLVMBuildStore(b, l_sbool_const(1), v_tmpisnullp);
+						LLVMBuildStore(b, l_datum_const(0), v_tmpvaluep);
 						LLVMBuildBr(b, opblocks[op->d.hashdatum.jumpdone]);
 					}
 					else

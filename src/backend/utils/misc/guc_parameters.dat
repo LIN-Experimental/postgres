@@ -2325,6 +2325,15 @@
   ifdef => 'DEBUG_BOUNDED_SORT',
 },
 
+{ name => 'output_plugin_libraries', type => 'string', context => 'PGC_SUSET', group => 'REPLICATION_SENDING',
+  short_desc => 'Lists libraries that may be named as logical decoding output plugins.',
+  long_desc => 'Users with REPLICATION privileges may only use plugins in this list when creating logical replication slots.',
+  # Note that src/bin/pg_upgrade/check.c assumes GUC_LIST_QUOTE here.
+  flags => 'GUC_LIST_INPUT | GUC_LIST_QUOTE | GUC_SUPERUSER_ONLY',
+  variable => 'output_plugin_libraries_string',
+  boot_val => '"pgoutput, test_decoding"',
+},
+
 { name => 'parallel_leader_participation', type => 'bool', context => 'PGC_USERSET', group => 'RESOURCES_WORKER_PROCESSES',
   short_desc => 'Controls whether Gather and Gather Merge also run subplans.',
   long_desc => 'Should gather nodes also run subplans or just gather tuples?',
@@ -3572,7 +3581,7 @@
 
 { name => 'wal_sender_shutdown_timeout', type => 'int', context => 'PGC_USERSET', group => 'REPLICATION_SENDING',
   short_desc => 'Sets the maximum time the server waits during shutdown for all WAL data to be replicated to the receiver.',
-  long_desc => '-1 disables the timeout',
+  long_desc => '-1 disables the timeout and waits for the receiver to catch up; 0 does not wait for the receiver to catch up.',
   flags => 'GUC_UNIT_MS',
   variable => 'wal_sender_shutdown_timeout',
   boot_val => '-1',
