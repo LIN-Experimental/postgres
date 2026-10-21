@@ -18,7 +18,6 @@ documentación general del proyecto.
 - [Ejecutar el contenedor](#ejecutar-el-contenedor)
 - [Configurar `pg_hba.conf` a mano](#configurar-pg_hbaconf-a-mano)
 - [Contrato de la API](#contrato-de-la-api)
-- [Probarlo de punta a punta](#probarlo-de-punta-a-punta)
 - [Problemas comunes](#problemas-comunes)
 - [Archivos que componen el método](#archivos-que-componen-el-método)
 
@@ -178,7 +177,7 @@ docker run -d --name pg -p 5432:5432 \
 | `LIN_HTTP_TIMEOUT` | no | Espera máxima en milisegundos. Por defecto `5000`. |
 | `LIN_CACHE_TTL` | no | **Segundos** que se reutiliza una autenticación aceptada. Por defecto `20`; `0` la desactiva; máximo `300`. |
 | `POSTGRES_USER` | no | Superusuario a crear. Por defecto `postgres`. |
-| `POSTGRES_PASSWORD` | no | Contraseña del superusuario, si no usas LIN. |
+| `POSTGRES_PASSWORD` | no | Contraseña del superusuario (se fija al crear el cluster). Sin LIN es obligatoria, salvo con `POSTGRES_HOST_AUTH_METHOD`. |
 | `POSTGRES_HOST_AUTH_METHOD` | no | Método para conexiones host cuando LIN no está configurado. |
 | `PGDATA` | no | Por defecto `/var/lib/postgresql/data`. |
 
@@ -220,6 +219,10 @@ conexión.
 En el primer arranque crea el cluster y, si `LIN_TENANT` y `LIN_AUTH_ENDPOINT`
 están presentes, configura `pg_hba.conf` para autenticar las conexiones host con
 `lin`. En arranques posteriores reutiliza el cluster existente sin tocarlo.
+
+La línea que añade usa `host`, no `hostssl`: la contraseña viaja en claro hasta
+el servidor. Para producción, termina TLS delante o cambia esa línea por
+`hostssl` (y configura `ssl = on` con certificado).
 
 Sin esas variables pide `POSTGRES_PASSWORD` (y usa `scram-sha-256`) o
 `POSTGRES_HOST_AUTH_METHOD=trust`. El socket local siempre queda en `trust`, que
@@ -420,79 +423,6 @@ Esa distinción está disponible en triggers y políticas RLS.
 
 ---
 
-## Probarlo de punta a punta
-
-`docker/mock-auth-api.py` es una API falsa para probar sin un servicio real.
-Trae tres usuarios: `alex`/`secreto123` → rol `app_writer`,
-`maria`/`otra456` → rol `app_reader`, y `sinrol`/`nada789` sin mapeo.
-
-```bash
-docker network create linnet
-
-# La API falsa
-docker run -d --name lin-mock --network linnet \
-  -v "$PWD/docker/mock-auth-api.py:/mock.py:ro" \
-  python:3.12-alpine python /mock.py
-
-# PostgreSQL apuntando a ella
-docker run -d --name linpg --network linnet \
-  -e LIN_TENANT=empresa-001 \
-  -e LIN_AUTH_ENDPOINT=http://lin-mock:8080/api/auth/login \
-  linplatform/postgres
-
-# Los roles que la API va a devolver
-docker exec linpg psql -U postgres \
-  -c 'CREATE ROLE app_writer LOGIN' \
-  -c 'CREATE ROLE app_reader LOGIN'
-
-# Autenticar. "alex" no existe como rol y aun así entra, como app_writer
-docker exec -e PGPASSWORD=secreto123 linpg \
-  psql -h 127.0.0.1 -U alex -d postgres -c 'SELECT current_user, system_user'
-```
-
-```
- current_user | system_user
---------------+-------------
- app_writer   | lin:alex
-```
-
-Con contraseña incorrecta:
-
-```bash
-docker exec -e PGPASSWORD=mala linpg psql -h 127.0.0.1 -U alex -d postgres -c 'SELECT 1'
-# FATAL:  LIN authentication failed for user "alex"
-```
-
-Y el motivo detallado, en el log del servidor:
-
-```bash
-docker logs linpg 2>&1 | grep -A1 "LIN authentication failed"
-```
-
-Para ver el mapeo en el log, arranca con `-c log_connections=all`:
-
-```
-LOG:  connection authenticated: identity="alex" method=lin (...pg_hba.conf:121)
-LOG:  connection mapped: user="alex" role="app_writer" method=lin
-```
-
-Limpieza:
-
-```bash
-docker rm -f linpg lin-mock && docker network rm linnet
-```
-
-En Windows, si el bind mount de `-v` da problemas, ejecuta el script dentro del
-contenedor pasándolo codificado:
-
-```bash
-B64=$(base64 -w0 docker/mock-auth-api.py)
-docker run -d --name lin-mock --network linnet -e SRC="$B64" python:3.12-alpine \
-  sh -c 'echo "$SRC" | base64 -d > /mock.py && exec python /mock.py'
-```
-
----
-
 ## Problemas comunes
 
 ### Al compilar
@@ -538,7 +468,7 @@ Y dos que **no** son fallos de LIN:
 Para ver qué se está enviando exactamente, sube el detalle del log:
 
 ```bash
-docker exec linpg psql -U postgres -c "ALTER SYSTEM SET log_connections = 'all'" \
+docker exec pg psql -U postgres -c "ALTER SYSTEM SET log_connections = 'all'" \
   -c 'SELECT pg_reload_conf()'
 ```
 
@@ -558,7 +488,7 @@ docker exec linpg psql -U postgres -c "ALTER SYSTEM SET log_connections = 'all'"
 | `src/include/libpq/libpq-be.h` | Campo `Port.mapped_role`. |
 | `src/bin/initdb/initdb.c` | Acepta `--auth-host=lin`. |
 | `doc/src/sgml/client-auth.sgml` | Documentación de referencia. |
-| `Dockerfile`, `docker/` | Imagen, entrypoint y API falsa de pruebas. |
+| `Dockerfile`, `docker/` | Imagen y entrypoint. |
 
 pgvector no vive en este árbol: la etapa `pgvector` del `Dockerfile` lo clona y
 lo compila contra la instalación resultante.
