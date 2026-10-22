@@ -175,6 +175,13 @@ typedef struct Port
 	char	   *mapped_role;
 
 	/*
+	 * True once the "lin" method has accepted this connection.  InitPostgres()
+	 * uses it to know that the session user has to be provisioned from the
+	 * API's answer; see LINInitializeSessionUser().
+	 */
+	bool		lin_authenticated;
+
+	/*
 	 * TCP keepalive and user timeout settings.
 	 *
 	 * default values are 0 if AF_UNIX or not yet known; current values are 0

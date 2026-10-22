@@ -1021,6 +1021,8 @@ CheckLINAuth(Port *port, const char **logdetail)
 
 	set_authn_id(port, port->user_name);
 
+	port->lin_authenticated = true;
+
 	if (mapped_role != NULL)
 	{
 		port->mapped_role = MemoryContextStrdup(TopMemoryContext, mapped_role);

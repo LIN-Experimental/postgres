@@ -78,8 +78,20 @@
  * the extern list out of storage/subsystemlist.h.
  */
 
+/*
+ * Role provisioning.  A connection the "lin" method accepted gets a database
+ * role named after the end user, created on first use and marked with this
+ * comment so that roles that were not made by us are never touched.  Its only
+ * membership is the role the API names (if any), refreshed at every login.
+ */
+#define LIN_ROLE_COMMENT		"Managed by the LIN authentication method"
+
+struct Port;
+
 extern void InitializeLINConfig(void);
 extern int	lin_authenticate(const char *username, const char *password,
 							 char **mapped_role, const char **logdetail);
+extern bool LINSessionNeedsProvisioning(struct Port *port);
+extern bool LINInitializeSessionUser(struct Port *port);
 
 #endif							/* PG_LIN_H */

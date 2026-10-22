@@ -41,16 +41,41 @@
 
 #include <curl/curl.h>
 
+#include "access/genam.h"
+#include "access/htup_details.h"
+#include "access/table.h"
+#include "access/xact.h"
+#include "access/xlog.h"
+#include "catalog/indexing.h"
+#include "catalog/pg_auth_members.h"
+#include "catalog/pg_authid.h"
+#include "catalog/pg_shdescription.h"
+#include "common/hashfn.h"
 #include "common/hmac.h"
 #include "common/jsonapi.h"
 #include "common/sha2.h"
 #include "lib/stringinfo.h"
+#include "libpq/libpq-be.h"
 #include "libpq/lin.h"
 #include "mb/pg_wchar.h"
+#include "miscadmin.h"
+#include "replication/walsender.h"
+#include "storage/lmgr.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
+#include "tcop/dest.h"
+#include "tcop/tcopprot.h"
+#include "tcop/utility.h"
+#include "utils/acl.h"
+#include "utils/builtins.h"
+#include "utils/catcache.h"
+#include "utils/fmgroids.h"
+#include "utils/guc.h"
 #include "utils/json.h"
 #include "utils/memutils.h"
+#include "utils/rel.h"
+#include "utils/snapmgr.h"
+#include "utils/syscache.h"
 #include "utils/timestamp.h"
 
 /*
@@ -827,4 +852,278 @@ lin_authenticate(const char *username, const char *password,
 	pfree(response.body.data);
 
 	return status;
+}
+
+
+/*----------------------------------------------------------------
+ * Role provisioning
+ *
+ * The role named in the startup packet is the end user's name in the tenant's
+ * API ("meu@lin"), which usually has no counterpart in the database.  Instead of
+ * running the whole session as the role the API maps it to, which hides who is
+ * connected, every login makes sure that a role named after the end user exists
+ * and that its one membership is the role the API returned just now.  The
+ * session then starts as that user and does SET ROLE to the mapped role, so
+ * session_user names the person and current_user carries the permissions.
+ *
+ * Only roles carrying LIN_ROLE_COMMENT are ever modified.  A user name that
+ * collides with a role somebody else made keeps the old behaviour: the session
+ * runs as the mapped role, or as that very role when the API maps nothing.
+ *
+ * Existing sessions are not touched.  Dropping or replacing a membership does
+ * not change the role a running session already assumed; only the next SET ROLE
+ * by that session would notice.  Logins of the same user are serialized by a
+ * lock held until the startup transaction commits, so the last one to log in
+ * leaves its role in place.
+ *----------------------------------------------------------------
+ */
+
+/*
+ * Does this login need its session user provisioned?  Walsenders keep the old
+ * path because their startup is different, and a standby cannot write the
+ * catalogs.
+ */
+bool
+LINSessionNeedsProvisioning(Port *port)
+{
+	return port->lin_authenticated && !am_walsender && !RecoveryInProgress();
+}
+
+/*
+ * Run one utility statement (CREATE ROLE, GRANT, ...) from C.  Follows what
+ * execute_sql_string() in extension.c does, minus the parts about extensions.
+ */
+static void
+lin_run_utility(const char *sql)
+{
+	List	   *raw_parsetree_list = pg_parse_query(sql);
+	ListCell   *lc1;
+
+	foreach(lc1, raw_parsetree_list)
+	{
+		RawStmt    *parsetree = lfirst_node(RawStmt, lc1);
+		List	   *stmt_list;
+		ListCell   *lc2;
+
+		stmt_list = pg_analyze_and_rewrite_fixedparams(parsetree, sql, NULL, 0,
+													   NULL);
+		stmt_list = pg_plan_queries(stmt_list, sql, CURSOR_OPT_PARALLEL_OK, NULL);
+
+		foreach(lc2, stmt_list)
+		{
+			PlannedStmt *stmt = lfirst_node(PlannedStmt, lc2);
+
+			CommandCounterIncrement();
+			PushActiveSnapshot(GetTransactionSnapshot());
+
+			ProcessUtility(stmt, sql, false, PROCESS_UTILITY_QUERY,
+						   NULL, NULL, None_Receiver, NULL);
+
+			PopActiveSnapshot();
+		}
+	}
+
+	CommandCounterIncrement();
+}
+
+/*
+ * Is this one of our roles?  GetComment() only reads pg_description, and roles
+ * are shared objects, so look in pg_shdescription directly.
+ */
+static bool
+lin_role_is_managed(Oid roleid)
+{
+	Relation	shdescription;
+	ScanKeyData skey[2];
+	SysScanDesc sd;
+	HeapTuple	tuple;
+	bool		managed = false;
+
+	ScanKeyInit(&skey[0],
+				Anum_pg_shdescription_objoid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(roleid));
+	ScanKeyInit(&skey[1],
+				Anum_pg_shdescription_classoid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(AuthIdRelationId));
+
+	shdescription = table_open(SharedDescriptionRelationId, AccessShareLock);
+	sd = systable_beginscan(shdescription, SharedDescriptionObjIndexId, true,
+							NULL, 2, skey);
+
+	tuple = systable_getnext(sd);
+	if (HeapTupleIsValid(tuple))
+	{
+		bool		isnull;
+		Datum		value;
+
+		value = heap_getattr(tuple, Anum_pg_shdescription_description,
+							 RelationGetDescr(shdescription), &isnull);
+		if (!isnull)
+		{
+			char	   *comment = TextDatumGetCString(value);
+
+			managed = (strcmp(comment, LIN_ROLE_COMMENT) == 0);
+			pfree(comment);
+		}
+	}
+
+	systable_endscan(sd);
+	table_close(shdescription, AccessShareLock);
+
+	return managed;
+}
+
+/*
+ * Bring the end user's role in line with the API's answer: create it if it is
+ * missing, then make its only membership the mapped role (or none).  Returns
+ * the OID of the role.
+ */
+static Oid
+lin_sync_role(const char *username, Oid useroid, Oid mappedoid)
+{
+	const char *quser = quote_identifier(username);
+	List	   *old_roles = NIL;
+	List	   *old_grantors = NIL;
+	bool		unchanged = false;
+	ListCell   *lr;
+	ListCell   *lg;
+
+	if (!OidIsValid(useroid))
+	{
+		lin_run_utility(psprintf("CREATE ROLE %s LOGIN", quser));
+		lin_run_utility(psprintf("COMMENT ON ROLE %s IS '%s'",
+								 quser, LIN_ROLE_COMMENT));
+		useroid = get_role_oid(username, false);
+
+		ereport(LOG,
+				(errmsg("created role \"%s\" for the LIN user", username)));
+	}
+	else
+	{
+		CatCList   *memlist;
+		int			i;
+
+		memlist = SearchSysCacheList1(AUTHMEMMEMROLE, ObjectIdGetDatum(useroid));
+
+		/* Nothing to do if the one existing membership is already the right one */
+		if (memlist->n_members == 1 && OidIsValid(mappedoid))
+		{
+			Form_pg_auth_members form =
+				(Form_pg_auth_members) GETSTRUCT(&memlist->members[0]->tuple);
+
+			unchanged = (form->roleid == mappedoid &&
+						 form->set_option && !form->inherit_option);
+		}
+		else if (memlist->n_members == 0 && !OidIsValid(mappedoid))
+			unchanged = true;
+
+		for (i = 0; i < memlist->n_members && !unchanged; i++)
+		{
+			Form_pg_auth_members form =
+				(Form_pg_auth_members) GETSTRUCT(&memlist->members[i]->tuple);
+
+			old_roles = lappend_oid(old_roles, form->roleid);
+			old_grantors = lappend_oid(old_grantors, form->grantor);
+		}
+
+		ReleaseSysCacheList(memlist);
+	}
+
+	if (unchanged)
+		return useroid;
+
+	forboth(lr, old_roles, lg, old_grantors)
+	{
+		char	   *role = pstrdup(quote_identifier(GetUserNameFromId(lfirst_oid(lr), false)));
+		char	   *grantor = pstrdup(quote_identifier(GetUserNameFromId(lfirst_oid(lg), false)));
+
+		lin_run_utility(psprintf("REVOKE %s FROM %s GRANTED BY %s",
+								 role, quser, grantor));
+	}
+
+	if (OidIsValid(mappedoid))
+	{
+		lin_run_utility(psprintf("GRANT %s TO %s WITH INHERIT FALSE, SET TRUE",
+								 quote_identifier(GetUserNameFromId(mappedoid, false)),
+								 quser));
+	}
+
+	ereport(LOG,
+			(errmsg("LIN user \"%s\" is now mapped to %s",
+					username,
+					OidIsValid(mappedoid) ? psprintf("role \"%s\"", GetUserNameFromId(mappedoid, false))
+					: "no role")));
+
+	return useroid;
+}
+
+/*
+ * Establish the session user for a connection the "lin" method accepted, after
+ * provisioning its role.  Called from InitPostgres() once the catalogs can be
+ * written.  Returns whether the session ends up as a superuser.
+ */
+bool
+LINInitializeSessionUser(Port *port)
+{
+	const char *username = port->user_name;
+	const char *mapped = port->mapped_role;
+	Oid			useroid;
+	Oid			mappedoid = InvalidOid;
+	bool		managed;
+	Oid			save_userid;
+	int			save_sec_context;
+
+	/* A role cannot belong to itself, so naming itself means no mapping. */
+	if (mapped != NULL && strcmp(mapped, username) == 0)
+		mapped = NULL;
+
+	/*
+	 * Nobody is the session user yet, and creating roles takes a superuser.
+	 * This is the only place the bootstrap superuser is borrowed, and only for
+	 * the statements below.
+	 */
+	GetUserIdAndSecContext(&save_userid, &save_sec_context);
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, 0);
+
+	/* Serialize logins of one user until this transaction commits. */
+	LockSharedObject(AuthIdRelationId,
+					 (Oid) hash_bytes((const unsigned char *) username,
+									  strlen(username)),
+					 0, ExclusiveLock);
+
+	if (mapped != NULL)
+	{
+		mappedoid = get_role_oid(mapped, true);
+		if (!OidIsValid(mappedoid))
+			ereport(FATAL,
+					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+					 errmsg("role \"%s\" does not exist", mapped),
+					 errdetail("The LIN authentication endpoint named it as the role for user \"%s\".",
+							   username)));
+	}
+
+	useroid = get_role_oid(username, true);
+	managed = !OidIsValid(useroid) || lin_role_is_managed(useroid);
+
+	if (managed)
+		lin_sync_role(username, useroid, mappedoid);
+
+	SetUserIdAndSecContext(save_userid, save_sec_context);
+
+	if (!managed)
+	{
+		/* Somebody else's role: behave as before provisioning existed. */
+		InitializeSessionUserId(port->mapped_role != NULL ? port->mapped_role : username,
+								InvalidOid, false);
+		return superuser();
+	}
+
+	InitializeSessionUserId(username, InvalidOid, false);
+
+	if (mapped != NULL)
+		SetConfigOption("role", mapped, PGC_BACKEND, PGC_S_OVERRIDE);
+
+	return superuser();
 }

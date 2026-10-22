@@ -35,6 +35,7 @@
 #include "catalog/pg_tablespace.h"
 #include "libpq/auth.h"
 #include "libpq/libpq-be.h"
+#include "libpq/lin.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -97,6 +98,7 @@ static void IdleSessionTimeoutHandler(void);
 static void IdleStatsUpdateTimeoutHandler(void);
 static void ClientCheckTimeoutHandler(void);
 static bool ThereIsAtLeastOneRole(void);
+static void CheckSessionSlots(bool am_superuser);
 static void process_startup_options(Port *port, bool am_superuser);
 static void process_settings(Oid databaseid, Oid roleid);
 static void EmitConnectionWarnings(void);
@@ -728,7 +730,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	bool		am_superuser;
 	char	   *fullpath;
 	char		dbname[NAMEDATALEN];
-	int			nfree = 0;
+	bool		lin_provision = false;
 
 	elog(DEBUG3, "InitPostgres");
 
@@ -947,23 +949,41 @@ InitPostgres(const char *in_dbname, Oid dboid,
 		Assert(MyProcPort != NULL);
 		PerformAuthentication(MyProcPort);
 
+#ifdef USE_LIN_AUTH
+
 		/*
-		 * An authentication method may have decided that this connection
-		 * should assume a different role than the one the client asked for,
-		 * in which case our caller's copy of the name is stale.
+		 * A connection the "lin" method accepted gets its session user
+		 * provisioned from the API's answer, which means writing to the
+		 * catalogs, which cannot be done before the database is selected.  So
+		 * the identity is settled further down, and until then there is none.
 		 */
-		if (MyProcPort->mapped_role != NULL)
+		if (LINSessionNeedsProvisioning(MyProcPort))
 		{
-			username = MyProcPort->mapped_role;
-			useroid = InvalidOid;
+			lin_provision = true;
+			am_superuser = false;	/* provisional, see below */
+		}
+		else
+#endif
+		{
+			/*
+			 * An authentication method may have decided that this connection
+			 * should assume a different role than the one the client asked
+			 * for, in which case our caller's copy of the name is stale.
+			 */
+			if (MyProcPort->mapped_role != NULL)
+			{
+				username = MyProcPort->mapped_role;
+				useroid = InvalidOid;
+			}
+
+			InitializeSessionUserId(username, useroid, false);
+			am_superuser = superuser();
 		}
 
-		InitializeSessionUserId(username, useroid, false);
 		/* ensure that auth_method is actually valid, aka authn_id is not NULL */
 		if (MyClientConnectionInfo.authn_id)
 			InitializeSystemUser(MyClientConnectionInfo.authn_id,
 								 hba_authname(MyClientConnectionInfo.auth_method));
-		am_superuser = superuser();
 	}
 
 	/* Report any SSL/GSS details for the session. */
@@ -974,42 +994,9 @@ InitPostgres(const char *in_dbname, Oid dboid,
 		pgstat_bestart_security();
 	}
 
-	/*
-	 * Binary upgrades only allowed super-user connections
-	 */
-	if (IsBinaryUpgrade && !am_superuser)
-	{
-		ereport(FATAL,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be superuser to connect in binary upgrade mode")));
-	}
-
-	/*
-	 * The last few regular connection slots are reserved for superusers and
-	 * roles with privileges of pg_use_reserved_connections.  We do not apply
-	 * these limits to background processes, since they all have their own
-	 * pools of PGPROC slots.
-	 *
-	 * Note: At this point, the new backend has already claimed a proc struct,
-	 * so we must check whether the number of free slots is strictly less than
-	 * the reserved connection limits.
-	 */
-	if (AmRegularBackendProcess() && !am_superuser &&
-		(SuperuserReservedConnections + ReservedConnections) > 0 &&
-		!HaveNFreeProcs(SuperuserReservedConnections + ReservedConnections, &nfree))
-	{
-		if (nfree < SuperuserReservedConnections)
-			ereport(FATAL,
-					(errcode(ERRCODE_TOO_MANY_CONNECTIONS),
-					 errmsg("remaining connection slots are reserved for roles with the %s attribute",
-							"SUPERUSER")));
-
-		if (!has_privs_of_role(GetUserId(), ROLE_PG_USE_RESERVED_CONNECTIONS))
-			ereport(FATAL,
-					(errcode(ERRCODE_TOO_MANY_CONNECTIONS),
-					 errmsg("remaining connection slots are reserved for roles with privileges of the \"%s\" role",
-							"pg_use_reserved_connections")));
-	}
+	/* Not yet knowing who we are, a provisioned session checks this later. */
+	if (!lin_provision)
+		CheckSessionSlots(am_superuser);
 
 	/* Check replication permissions needed for walsender processes. */
 	if (am_walsender)
@@ -1241,6 +1228,20 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	/* set up ACL framework (so CheckMyDatabase can check permissions) */
 	initialize_acl();
 
+#ifdef USE_LIN_AUTH
+
+	/*
+	 * Now that the catalogs can be written, provision the role of a "lin"
+	 * connection and settle who the session user is, then do the checks that
+	 * could not be made without knowing it.
+	 */
+	if (lin_provision)
+	{
+		am_superuser = LINInitializeSessionUser(MyProcPort);
+		CheckSessionSlots(am_superuser);
+	}
+#endif
+
 	/*
 	 * Re-read the pg_database row for our database, check permissions and set
 	 * up database-specific GUC settings.  We can't do this until all the
@@ -1300,6 +1301,53 @@ InitPostgres(const char *in_dbname, Oid dboid,
 
 	/* send any WARNINGs we've accumulated during initialization */
 	EmitConnectionWarnings();
+}
+
+/*
+ * Checks that depend on who the session user is, split out of InitPostgres()
+ * because a "lin" connection only learns that late.
+ */
+static void
+CheckSessionSlots(bool am_superuser)
+{
+	int			nfree = 0;
+
+	/*
+	 * Binary upgrades only allowed super-user connections
+	 */
+	if (IsBinaryUpgrade && !am_superuser)
+	{
+		ereport(FATAL,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to connect in binary upgrade mode")));
+	}
+
+	/*
+	 * The last few regular connection slots are reserved for superusers and
+	 * roles with privileges of pg_use_reserved_connections.  We do not apply
+	 * these limits to background processes, since they all have their own
+	 * pools of PGPROC slots.
+	 *
+	 * Note: At this point, the new backend has already claimed a proc struct,
+	 * so we must check whether the number of free slots is strictly less than
+	 * the reserved connection limits.
+	 */
+	if (AmRegularBackendProcess() && !am_superuser &&
+		(SuperuserReservedConnections + ReservedConnections) > 0 &&
+		!HaveNFreeProcs(SuperuserReservedConnections + ReservedConnections, &nfree))
+	{
+		if (nfree < SuperuserReservedConnections)
+			ereport(FATAL,
+					(errcode(ERRCODE_TOO_MANY_CONNECTIONS),
+					 errmsg("remaining connection slots are reserved for roles with the %s attribute",
+							"SUPERUSER")));
+
+		if (!has_privs_of_role(GetUserId(), ROLE_PG_USE_RESERVED_CONNECTIONS))
+			ereport(FATAL,
+					(errcode(ERRCODE_TOO_MANY_CONNECTIONS),
+					 errmsg("remaining connection slots are reserved for roles with privileges of the \"%s\" role",
+							"pg_use_reserved_connections")));
+	}
 }
 
 /*
