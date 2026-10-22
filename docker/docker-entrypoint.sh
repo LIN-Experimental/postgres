@@ -11,8 +11,11 @@
 #	LIN_TENANT					tenant owning this instance
 #	LIN_AUTH_ENDPOINT			URL of the login API
 #	LIN_HTTP_TIMEOUT			API timeout in milliseconds (default 5000)
-#	POSTGRES_USER				superuser to create (default postgres)
-#	POSTGRES_PASSWORD			superuser password
+#	POSTGRES_USER				default superuser to create (default postgres)
+#	POSTGRES_PASSWORD			its password; with LIN enabled this user logs in
+#								with it (scram-sha-256) instead of going through
+#								the API.  Both are only used when the cluster is
+#								first created.
 #	POSTGRES_HOST_AUTH_METHOD	host method to use when LIN is not configured
 #
 set -Eeuo pipefail
@@ -80,6 +83,14 @@ init_cluster()
 	# up to the rest of the container network as well.
 	if lin_enabled; then
 		{
+			# The default user keeps logging in with its own password; the LIN
+			# API is only asked about everybody else.  First match wins, so this
+			# rule has to come before the catch-all one.
+			if [ -n "${POSTGRES_PASSWORD:-}" ]; then
+				echo
+				echo "# Added by docker-entrypoint.sh: default user"
+				printf 'host\tall\t\t"%s"\t\tall\t\t\tscram-sha-256\n' "${POSTGRES_USER//\"/\"\"}"
+			fi
 			echo
 			echo "# Added by docker-entrypoint.sh: LIN authentication"
 			printf 'host\tall\t\tall\t\tall\t\t\tlin\n'
