@@ -2706,11 +2706,14 @@ CONTEXT:  line 2 of configuration file "data/pg_hba.conf"
      which must exist in the database, exactly as with
      <link linkend="auth-ldap">LDAP</link> or <link linkend="auth-pam">PAM</link>.
      A successful response may instead name the role the connection should
-     assume, in a top-level string field called <structfield>role</structfield>:
+     assume, in a string field called <structfield>role</structfield> inside the
+     top-level <structfield>metadata</structfield> object:
 <programlisting>
 {
     "authenticated": true,
-    "role": "app_reader"
+    "metadata": {
+        "role": "app_reader"
+    }
 }
 </programlisting>
      This lets a tenant map many end users onto a handful of database roles,
@@ -2728,9 +2731,11 @@ CONTEXT:  line 2 of configuration file "data/pg_hba.conf"
     </para>
 
     <para>
-     If the field is absent or null, the client keeps the role it asked for.
+     If <structfield>metadata</structfield> or <structfield>role</structfield> is
+     absent or null, the client keeps the role it asked for.
      Anything else is treated as an authentication failure rather than guessed
      at, since the alternative would be to connect as the wrong role: a
+     <structfield>metadata</structfield> that is neither an object nor null, a
      <structfield>role</structfield> that is not a string, an empty name, or a
      name that does not fit in <symbol>NAMEDATALEN</symbol>.  The same applies to
      a response that cannot be read at all, whether because it is not valid

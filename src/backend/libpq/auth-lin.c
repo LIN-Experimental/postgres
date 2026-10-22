@@ -108,17 +108,23 @@ typedef enum LINField
 {
 	LIN_FIELD_NONE = 0,
 	LIN_FIELD_AUTHENTICATED,
+	LIN_FIELD_METADATA,
 	LIN_FIELD_ROLE,
 } LINField;
 
 /*
  * State for pulling the fields we care about out of a response.  Only
- * top-level fields count, so the nesting depth has to be tracked.
+ * top-level fields, and the role inside the top-level metadata object, count,
+ * so the nesting depth has to be tracked.
  */
 typedef struct LINResponseParse
 {
 	int			depth;
+	int			metadata_depth;	/* depth of the metadata object's fields, or 0
+								 * when not inside it */
 	LINField	expecting;		/* whose value comes next */
+
+	bool		metadata_bad_type;	/* metadata was neither an object nor null */
 
 	bool		auth_seen;		/* was LIN_AUTH_FIELD present? */
 	bool		authenticated;	/* ... and was it true? */
@@ -493,7 +499,7 @@ lin_build_request_body(StringInfo body, const char *username,
 /*
  * pg_parse_json callbacks for lin_check_response().  Between them they answer
  * two questions about the top-level object: did LIN_AUTH_FIELD say true, and
- * what does LIN_ROLE_FIELD name?
+ * what does LIN_ROLE_FIELD, inside LIN_METADATA_FIELD, name?
  */
 
 /*
@@ -508,6 +514,9 @@ lin_reject_composite(LINResponseParse *parse)
 		case LIN_FIELD_AUTHENTICATED:
 			parse->auth_seen = true;
 			parse->auth_bad_type = true;
+			break;
+		case LIN_FIELD_METADATA:
+			parse->metadata_bad_type = true;
 			break;
 		case LIN_FIELD_ROLE:
 			parse->role_bad_type = true;
@@ -524,6 +533,15 @@ lin_object_start(void *state)
 {
 	LINResponseParse *parse = (LINResponseParse *) state;
 
+	/* An object is exactly what metadata should be. */
+	if (parse->expecting == LIN_FIELD_METADATA)
+	{
+		parse->expecting = LIN_FIELD_NONE;
+		parse->depth++;
+		parse->metadata_depth = parse->depth;
+		return JSON_SUCCESS;
+	}
+
 	lin_reject_composite(parse);
 	parse->depth++;
 	return JSON_SUCCESS;
@@ -532,7 +550,11 @@ lin_object_start(void *state)
 static JsonParseErrorType
 lin_object_end(void *state)
 {
-	((LINResponseParse *) state)->depth--;
+	LINResponseParse *parse = (LINResponseParse *) state;
+
+	if (parse->depth == parse->metadata_depth)
+		parse->metadata_depth = 0;
+	parse->depth--;
 	return JSON_SUCCESS;
 }
 
@@ -558,7 +580,16 @@ lin_field_start(void *state, char *fname, bool isnull)
 {
 	LINResponseParse *parse = (LINResponseParse *) state;
 
-	/* Only the outermost object is interesting. */
+	/* The role lives directly inside the top-level metadata object. */
+	if (parse->depth == 2 && parse->metadata_depth == 2)
+	{
+		/* A null role just means "no opinion". */
+		if (!isnull && strcmp(fname, LIN_ROLE_FIELD) == 0)
+			parse->expecting = LIN_FIELD_ROLE;
+		return JSON_SUCCESS;
+	}
+
+	/* Otherwise only the outermost object is interesting. */
 	if (parse->depth != 1)
 		return JSON_SUCCESS;
 
@@ -571,10 +602,10 @@ lin_field_start(void *state, char *fname, bool isnull)
 		 */
 		parse->expecting = LIN_FIELD_AUTHENTICATED;
 	}
-	else if (!isnull && strcmp(fname, LIN_ROLE_FIELD) == 0)
+	else if (!isnull && strcmp(fname, LIN_METADATA_FIELD) == 0)
 	{
-		/* A null role, on the other hand, just means "no opinion". */
-		parse->expecting = LIN_FIELD_ROLE;
+		/* A null metadata, on the other hand, just means "no opinion". */
+		parse->expecting = LIN_FIELD_METADATA;
 	}
 
 	return JSON_SUCCESS;
@@ -601,6 +632,11 @@ lin_scalar(void *state, char *token, JsonTokenType tokentype)
 				parse->auth_bad_type = true;
 			break;
 
+		case LIN_FIELD_METADATA:
+			/* A scalar where an object was due (null never gets here). */
+			parse->metadata_bad_type = true;
+			break;
+
 		case LIN_FIELD_ROLE:
 			if (tokentype == JSON_TOKEN_STRING)
 				parse->role = token;
@@ -621,7 +657,8 @@ lin_scalar(void *state, char *token, JsonTokenType tokentype)
  * Two things can still be learned from it.  If LIN_AUTH_FIELD is present it has
  * the last word on whether the credentials were accepted, so that a service
  * reporting a rejection with HTTP 200 is not mistaken for a success.  And
- * LIN_ROLE_FIELD, if present, names the role the connection should assume;
+ * LIN_ROLE_FIELD of the LIN_METADATA_FIELD object, if present, names the role
+ * the connection should assume;
  * *role is set to it, or to NULL when the response says nothing, in which case
  * the client keeps the name it asked for.
  *
@@ -689,6 +726,13 @@ lin_check_response(const LINResponse *response, char **role,
 	{
 		*logdetail = psprintf(_("The LIN authentication endpoint \"%s\" returned \"%s\": false."),
 							  lin_config.endpoint, LIN_AUTH_FIELD);
+		return STATUS_ERROR;
+	}
+
+	if (parse.metadata_bad_type)
+	{
+		*logdetail = psprintf(_("The \"%s\" field returned by the LIN authentication endpoint \"%s\" is neither an object nor null."),
+							  LIN_METADATA_FIELD, lin_config.endpoint);
 		return STATUS_ERROR;
 	}
 

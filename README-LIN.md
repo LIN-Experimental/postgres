@@ -376,7 +376,9 @@ tiene la última palabra.
 ```json
 {
     "authenticated": true,
-    "role": "app_writer"
+    "metadata": {
+        "role": "app_writer"
+    }
 }
 ```
 
@@ -385,21 +387,22 @@ tiene la última palabra.
 | `authenticated: true` | Credenciales aceptadas. |
 | `authenticated: false` | Rechazado, aunque el código HTTP sea 200. |
 | `authenticated` ausente | Manda el código HTTP; un cuerpo vacío es válido. |
-| `role: "<nombre>"` | La conexión asume ese rol. Ver abajo. |
-| `role` ausente o `null` | El cliente conserva el rol que pidió. |
+| `metadata.role: "<nombre>"` | La conexión asume ese rol. Ver abajo. |
+| `metadata` o `metadata.role` ausente o `null` | El cliente conserva el rol que pidió. |
 
 Se rechaza, en lugar de interpretarse, cualquier cosa ambigua: un
 `authenticated` que no sea booleano (incluidos `null`, `1` y la cadena
-`"true"`), un `role` que no sea cadena, un `role` vacío o de más de 63 bytes, un
-cuerpo que no sea JSON válido, y un cuerpo de más de 8 kB. El motivo concreto
-queda en el log del servidor.
+`"true"`), un `metadata` que no sea objeto ni `null`, un `metadata.role` que no
+sea cadena, un `role` vacío o de más de 63 bytes, un cuerpo que no sea JSON
+válido, y un cuerpo de más de 8 kB. El motivo concreto queda en el log del
+servidor.
 
-Solo se miran los campos de **primer nivel**; un `role` anidado dentro de otro
-objeto se ignora.
+Solo se miran `authenticated` y `metadata` en el **primer nivel**, y `role`
+directamente dentro de `metadata`; un `role` en cualquier otro sitio se ignora.
 
 ### Mapeo de roles
 
-Cuando la respuesta trae `role`, la conexión asume ese rol en lugar del que pidió
+Cuando la respuesta trae `metadata.role`, la conexión asume ese rol en lugar del que pidió
 el cliente. Así puedes mapear muchos usuarios finales sobre unos pocos roles de
 base de datos, sin mantener un rol por persona. **El rol nombrado tiene que
 existir**; no se crea al vuelo.

@@ -44,12 +44,13 @@
 #define LIN_MAX_RESPONSE_SIZE	8192
 
 /*
- * Optional top-level fields of the response.  LIN_AUTH_FIELD, when present,
- * must be the boolean true or the credentials are rejected; LIN_ROLE_FIELD
- * names the database role the connection should assume, instead of the one the
- * client asked for.
+ * Optional fields of the response.  LIN_AUTH_FIELD, when present at top level,
+ * must be the boolean true or the credentials are rejected.  LIN_METADATA_FIELD
+ * is a top-level object (or null) whose LIN_ROLE_FIELD names the database role
+ * the connection should assume, instead of the one the client asked for.
  */
 #define LIN_AUTH_FIELD			"authenticated"
+#define LIN_METADATA_FIELD		"metadata"
 #define LIN_ROLE_FIELD			"role"
 
 /*
