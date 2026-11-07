@@ -91,6 +91,14 @@ RUN cd pgvector \
 	&& strip --strip-unneeded /usr/local/pgsql/lib/vector.so
 
 ###############################################################################
+# OpenResty (proxy de validación de IP)
+###############################################################################
+FROM openresty/openresty:bookworm-fat AS openresty
+
+# Cliente HTTP de Lua que usa el proxy para llamar a la API de LIN
+RUN /usr/local/openresty/luajit/bin/luarocks install lua-resty-http
+
+###############################################################################
 # Runtime stage
 ###############################################################################
 FROM debian:bookworm-slim
@@ -117,6 +125,10 @@ RUN apt-get update \
 ENV LANG=en_US.utf8
 ENV PATH=/usr/local/pgsql/bin:$PATH
 ENV PGDATA=/var/lib/postgresql/data
+# PostgreSQL escucha en 5433 y el proxy de LIN en 5432 (ver docker/nginx.conf).
+# PGPORT lo leen tanto el servidor como psql, así que "docker exec ... psql"
+# sigue funcionando. El entrypoint lo cambia a 5432 si el proxy se desactiva.
+ENV PGPORT=5433
 
 # From the pgvector stage, which builds on top of the PostgreSQL install.
 COPY --from=pgvector /usr/local/pgsql /usr/local/pgsql
@@ -130,14 +142,25 @@ RUN echo /usr/local/pgsql/lib > /etc/ld.so.conf.d/pgsql.conf \
 	&& chown -R postgres:postgres /var/lib/postgresql /var/run/postgresql \
 	&& chmod 700 "$PGDATA"
 
+# OpenResty con lua-resty-http, sin dependencias extra: trae su propio
+# OpenSSL, PCRE2 y LuaJIT. Corre como "postgres", así que su prefijo de
+# trabajo (pid y logs) tiene que ser escribible por ese usuario.
+COPY --from=openresty /usr/local/openresty /usr/local/openresty
+RUN mkdir -p /var/run/openresty/logs \
+	&& chown -R postgres:postgres /var/run/openresty
+
+COPY docker/nginx.conf /etc/lin/nginx.conf
 COPY docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 # The build context may come from a checkout with CRLF line endings.
-RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh \
+RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh /etc/lin/nginx.conf \
 	&& chmod 755 /usr/local/bin/docker-entrypoint.sh
 
 VOLUME /var/lib/postgresql/data
 EXPOSE 5432
 USER postgres
+
+# Parada rápida de PostgreSQL; el entrypoint reenvía la señal al servidor y al proxy
+STOPSIGNAL SIGINT
 
 ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["postgres"]

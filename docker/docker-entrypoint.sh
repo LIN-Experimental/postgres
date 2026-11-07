@@ -17,6 +17,11 @@
 #								the API.  Both are only used when the cluster is
 #								first created.
 #	POSTGRES_HOST_AUTH_METHOD	host method to use when LIN is not configured
+#	RESOURCE					integer id of this resource for the IP validation
+#								(default 0)
+#	LIN_IP_VALIDATION			"off" removes the IP-validating proxy; postgres
+#								then listens on 5432 directly
+#	LIN_IP_VALIDATION_URL		overrides the validation API URL (testing)
 #
 set -Eeuo pipefail
 
@@ -31,6 +36,12 @@ log()
 lin_enabled()
 {
 	[ -n "${LIN_TENANT:-}" ] && [ -n "${LIN_AUTH_ENDPOINT:-}" ]
+}
+
+# La validación de IP contra la API de LIN va activa salvo LIN_IP_VALIDATION=off
+ip_validation_enabled()
+{
+	[ "${LIN_IP_VALIDATION:-on}" != "off" ]
 }
 
 # Decide how host connections authenticate.  LIN wins when it is configured,
@@ -127,6 +138,43 @@ if [ "${1:-}" = 'postgres' ] && ! wants_help "$@"; then
 	else
 		log "reusing the existing cluster in $PGDATA"
 	fi
+
+	if ip_validation_enabled; then
+		# RESOURCE se concatena tal cual en el JSON que recibe la API
+		RESOURCE="${RESOURCE:-0}"
+		if ! [[ "$RESOURCE" =~ ^[0-9]+$ ]]; then
+			echo "Error: RESOURCE ('$RESOURCE') debe ser un entero" >&2
+			exit 1
+		fi
+		export RESOURCE
+
+		log "IP validation enabled: proxy on 5432 -> postgres on 5433 (resource=$RESOURCE)"
+
+		# PostgreSQL en segundo plano (puerto 5433, por PGPORT) y el proxy de LIN
+		# delante. Si cualquiera de los dos muere, el contenedor termina.
+		"$@" &
+		pg_pid=$!
+		/usr/local/openresty/bin/openresty -p /var/run/openresty -c /etc/lin/nginx.conf -g 'daemon off;' &
+		proxy_pid=$!
+
+		# docker stop: parada rápida de PostgreSQL y cierre ordenado del proxy
+		stopping=0
+		trap 'stopping=1; kill -INT "$pg_pid" 2>/dev/null || true; kill -QUIT "$proxy_pid" 2>/dev/null || true' INT TERM
+
+		status=0
+		wait -n "$pg_pid" "$proxy_pid" || status=$?
+		# Una parada pedida (docker stop) es una salida limpia, no el código de la señal
+		if [ "$stopping" = 1 ]; then
+			status=0
+		fi
+		kill -INT "$pg_pid" 2>/dev/null || true
+		kill -QUIT "$proxy_pid" 2>/dev/null || true
+		wait || true
+		exit "$status"
+	fi
+
+	log "IP validation disabled: postgres listens on 5432"
+	export PGPORT=5432
 fi
 
 exec "$@"
