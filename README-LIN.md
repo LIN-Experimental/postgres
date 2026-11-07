@@ -159,6 +159,57 @@ docker push linplatform/postgres:20devel
 
 ## Ejecutar el contenedor
 
+### Requisitos
+
+- Docker instalado.
+- **`RESOURCE`**: el ID numérico del recurso registrado en LIN Platform. Es lo que enlaza este contenedor con su lista de IPs permitidas.
+- **Cómo se autentican los usuarios** (al menos una de estas): `LIN_TENANT` + `LIN_AUTH_ENDPOINT` (autenticación LIN), `POSTGRES_PASSWORD` (`scram-sha-256`) o `POSTGRES_HOST_AUTH_METHOD=trust`. Sin ninguna, el contenedor no arranca.
+- **Salida a internet** desde el contenedor: HTTPS (`443`) hacia `api.linplatform.com` y DNS hacia `8.8.8.8`/`1.1.1.1` (UDP `53`), que son los resolvers que usa el proxy. Si la API no responde, **se rechazan todas las conexiones** (falla cerrado).
+- **La IP del cliente autorizada** en la plataforma LIN para ese recurso. El proxy valida la IP con la que llega la conexión al contenedor: detrás de un NAT, de un balanceador o de la red de Docker Desktop puede no ser la IP pública real del cliente.
+
+### Con protección de IPs
+
+La validación de IP está activa por defecto. Ejemplo mínimo con contraseña propia:
+
+```bash
+docker run -d --name pg -p 5432:5432 \
+  -e RESOURCE=101 \
+  -e POSTGRES_PASSWORD=tu_contraseña_segura \
+  -v pgdata:/var/lib/postgresql/data \
+  linplatform/postgres
+```
+
+Y con autenticación LIN además de la validación de IP:
+
+```bash
+docker run -d --name pg -p 5432:5432 \
+  -e RESOURCE=101 \
+  -e LIN_TENANT=empresa-001 \
+  -e LIN_AUTH_ENDPOINT=https://auth.miempresa.com/api/auth/login \
+  -v pgdata:/var/lib/postgresql/data \
+  linplatform/postgres
+```
+
+Al arrancar, el log debe decir `IP validation enabled: proxy on 5432 -> postgres on 5433 (resource=101)`. Para comprobar que funciona:
+
+```bash
+# Desde una IP autorizada: conecta
+psql -h <host> -p 5432 -U postgres
+
+# Desde una IP no autorizada: "server closed the connection unexpectedly"
+```
+
+Solo para desarrollo local, sin llamar a la API (Postgres escucha directo en `5432`):
+
+```bash
+docker run -d --name pg-dev -p 5432:5432 \
+  -e LIN_IP_VALIDATION=off \
+  -e POSTGRES_PASSWORD=1234 \
+  linplatform/postgres
+```
+
+### Ejemplo solo con autenticación LIN
+
 ```bash
 docker run -d --name pg -p 5432:5432 \
   -e LIN_TENANT=empresa-001 \
@@ -180,10 +231,17 @@ docker run -d --name pg -p 5432:5432 \
 | `POSTGRES_PASSWORD` | no | Contraseña del superusuario (se fija al crear el cluster). Sin LIN es obligatoria, salvo con `POSTGRES_HOST_AUTH_METHOD`. |
 | `POSTGRES_HOST_AUTH_METHOD` | no | Método para conexiones host cuando LIN no está configurado. |
 | `PGDATA` | no | Por defecto `/var/lib/postgresql/data`. |
+| `RESOURCE` | no | ID numérico (entero) del recurso para la validación de IP. Por defecto `0`. |
+| `LIN_IP_VALIDATION` | no | `off` desactiva la validación de IP y Postgres escucha directo en `5432`. Cualquier otro valor la deja activa. |
+| `LIN_IP_VALIDATION_URL` | no | URL de la API de validación de IP. Por defecto `https://api.linplatform.com/developer/resources/validations/eval`. |
 
 Las cuatro primeras **se leen una sola vez, al arrancar el servidor**, y los
 valores se reutilizan durante toda la vida del proceso. Cambiarlas exige
 reiniciar, no basta con recargar la configuración.
+
+### Validación de IP
+
+Un proxy OpenResty escucha en `5432`, valida la IP del cliente contra la API de LIN y reenvía a PostgreSQL, que escucha en `5433` dentro del contenedor (`PGPORT=5433`, así `docker exec ... psql` sigue funcionando). PostgreSQL ve todas las conexiones desde `127.0.0.1`. Con `LIN_IP_VALIDATION=off` no se levanta el proxy.
 
 ### Caché de autenticación
 
