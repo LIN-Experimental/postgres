@@ -199,6 +199,14 @@ psql -h <host> -p 5432 -U postgres
 # Desde una IP no autorizada: "server closed the connection unexpectedly"
 ```
 
+Cada conexión validada deja una línea de auditoría en `docker logs` con la IP del cliente:
+
+```
+[notice] ... Acceso concedido para IP: 203.0.113.7
+[warn]   ... Acceso denegado para IP: 198.51.100.4 Status: 403
+[error]  ... Error contactando API: ...   (la API no respondió: se rechaza la conexión)
+```
+
 Solo para desarrollo local, sin llamar a la API (Postgres escucha directo en `5432`):
 
 ```bash
