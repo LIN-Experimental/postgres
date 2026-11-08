@@ -216,6 +216,33 @@ docker run -d --name pg-dev -p 5432:5432 \
   linplatform/postgres
 ```
 
+### Detrás de un proxy TCP (PROXY protocol)
+
+Si delante de este contenedor hay un proxy TCP (por ejemplo Caddy con `layer4`), la IP que ve el firewall es la del proxy, no la del cliente. Para que valide la IP real, el proxy debe enviarla con el PROXY protocol y la imagen debe esperarla.
+
+**En el contenedor:**
+
+```bash
+-e LIN_PROXY_PROTOCOL=on -e LIN_TRUSTED_PROXIES=203.0.113.10
+```
+
+**En Caddy (layer4)**, en el handler `proxy` de la ruta que apunta a este contenedor:
+
+```json
+{
+  "handler": "proxy",
+  "proxy_protocol": "v2",
+  "upstreams": [{ "dial": ["host-del-contenedor:5432"] }]
+}
+```
+
+Puntos a tener en cuenta:
+
+- Con `LIN_PROXY_PROTOCOL=on`, **toda** conexión al puerto `5432` debe traer la cabecera; una conexión directa (sin proxy) se rechaza. Actívalo solo si el contenedor está detrás del proxy.
+- `LIN_TRUSTED_PROXIES` debe contener la IP **desde la que llega la conexión al contenedor** (la del servidor de Caddy). Si llega desde otra, la cabecera se ignora y se valida esa IP; en `docker logs` aparece `Cabecera PROXY ignorada: X no está en LIN_TRUSTED_PROXIES`, y esa `X` es la que hay que poner. Sin esta lista cualquiera que alcance el puerto podría declarar una IP autorizada.
+- Solo se aceptan IPs exactas (no rangos CIDR). Restringe también el acceso al puerto con el firewall del servidor para que solo lo alcance el proxy.
+- Si Caddy termina el TLS (`"handler": "tls"`), PostgreSQL recibe la conexión sin cifrar y la cabecera va delante: funciona igual.
+
 ### Ejemplo solo con autenticación LIN
 
 ```bash
@@ -242,6 +269,8 @@ docker run -d --name pg -p 5432:5432 \
 | `RESOURCE` | no | ID numérico (entero) del recurso para la validación de IP. Por defecto `0`. |
 | `LIN_IP_VALIDATION` | no | `off` desactiva la validación de IP y Postgres escucha directo en `5432`. Cualquier otro valor la deja activa. |
 | `LIN_IP_VALIDATION_URL` | no | URL de la API de validación de IP. Por defecto `https://api.linplatform.com/developer/resources/validations/eval`. |
+| `LIN_PROXY_PROTOCOL` | `on` espera la cabecera [PROXY protocol](#detrás-de-un-proxy-tcp-proxy-protocol) en cada conexión, para obtener la IP real del cliente cuando hay un proxy TCP delante (Caddy, HAProxy...). | (apagado) |
+| `LIN_TRUSTED_PROXIES` | IPs del proxy, separadas por comas, de las que se acepta la cabecera. **Obligatoria** con `LIN_PROXY_PROTOCOL=on`. | (Vacía) |
 
 Las cuatro primeras **se leen una sola vez, al arrancar el servidor**, y los
 valores se reutilizan durante toda la vida del proceso. Cambiarlas exige

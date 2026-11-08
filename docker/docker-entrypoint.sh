@@ -150,11 +150,26 @@ if [ "${1:-}" = 'postgres' ] && ! wants_help "$@"; then
 
 		log "IP validation enabled: proxy on 5432 -> postgres on 5433 (resource=$RESOURCE)"
 
+		# PROXY protocol: la IP real llega en la cabecera del proxy TCP de delante (p. ej. Caddy layer4
+		# con "proxy_protocol": "v2"). Con esto activo TODA conexión debe traerla. LIN_TRUSTED_PROXIES
+		# lista las IPs desde las que se confía en ella.
+		proxy_conf=/etc/lin/nginx.conf
+		if [ "${LIN_PROXY_PROTOCOL:-off}" = "on" ]; then
+			if [ -z "${LIN_TRUSTED_PROXIES:-}" ]; then
+				echo "Error: LIN_PROXY_PROTOCOL=on requiere LIN_TRUSTED_PROXIES (IPs del proxy, separadas por comas)" >&2
+				exit 1
+			fi
+			export LIN_TRUSTED_PROXIES
+			proxy_conf=/var/run/openresty/nginx.conf
+			sed 's/listen 5432;/listen 5432 proxy_protocol;/' /etc/lin/nginx.conf > "$proxy_conf"
+			log "PROXY protocol enabled (trusted proxies: $LIN_TRUSTED_PROXIES)"
+		fi
+
 		# PostgreSQL en segundo plano (puerto 5433, por PGPORT) y el proxy de LIN
 		# delante. Si cualquiera de los dos muere, el contenedor termina.
 		"$@" &
 		pg_pid=$!
-		/usr/local/openresty/bin/openresty -p /var/run/openresty -c /etc/lin/nginx.conf -g 'daemon off;' &
+		/usr/local/openresty/bin/openresty -p /var/run/openresty -c "$proxy_conf" -g 'daemon off;' &
 		proxy_pid=$!
 
 		# docker stop: parada rápida de PostgreSQL y cierre ordenado del proxy
