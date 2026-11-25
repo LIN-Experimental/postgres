@@ -23,6 +23,7 @@
 #include <pwd.h>
 #include <unistd.h>
 
+#include "catalog/pg_authid.h"
 #include "commands/user.h"
 #include "common/ip.h"
 #include "common/md5.h"
@@ -41,6 +42,7 @@
 #include "storage/ipc.h"
 #include "tcop/backend_startup.h"
 #include "utils/memutils.h"
+#include "utils/syscache.h"
 
 /*----------------------------------------------------------------
  * Global authentication functions
@@ -861,7 +863,8 @@ CheckPWChallengeAuth(Port *port, const char **logdetail)
 	PasswordType pwtype;
 
 	Assert(port->hba->auth_method == uaSCRAM ||
-		   port->hba->auth_method == uaMD5);
+		   port->hba->auth_method == uaMD5 ||
+		   port->hba->auth_method == uaLIN);
 
 	/* First look up the user's password. */
 	shadow_pass = get_role_password(port->user_name, logdetail);
@@ -890,7 +893,8 @@ CheckPWChallengeAuth(Port *port, const char **logdetail)
 	 * had an MD5 password, CheckSASLAuth() with the SCRAM mechanism will
 	 * fail.
 	 */
-	if (port->hba->auth_method == uaMD5 && pwtype == PASSWORD_TYPE_MD5)
+	if ((port->hba->auth_method == uaMD5 || port->hba->auth_method == uaLIN) &&
+		pwtype == PASSWORD_TYPE_MD5)
 		auth_result = CheckMD5Auth(port, shadow_pass, logdetail);
 	else
 		auth_result = CheckSASLAuth(&pg_be_scram_mech, port, shadow_pass,
@@ -978,6 +982,29 @@ queue_md5_password_warning(void)
 #ifdef USE_LIN_AUTH
 
 /*
+ * Does this role exist with a password in pg_authid?
+ *
+ * An expired password still counts as one, so an expired local role fails
+ * instead of falling through to the API.
+ */
+static bool
+role_has_local_password(const char *role)
+{
+	HeapTuple	roleTup;
+	bool		isnull;
+
+	roleTup = SearchSysCache1(AUTHNAME, PointerGetDatum(role));
+	if (!HeapTupleIsValid(roleTup))
+		return false;
+
+	(void) SysCacheGetAttr(AUTHNAME, roleTup, Anum_pg_authid_rolpassword,
+						   &isnull);
+	ReleaseSysCache(roleTup);
+
+	return !isnull;
+}
+
+/*
  * Ask the client for a password and have the tenant's REST API verify it.
  *
  * The tenant is not part of the exchange with the client: it always comes from
@@ -989,6 +1016,12 @@ queue_md5_password_warning(void)
  * per user.  That is recorded in port->mapped_role for InitPostgres() to act
  * on; port->user_name keeps naming the end user, so the authenticated identity
  * and any log message still identify the person who connected.
+ *
+ * The local catalog is consulted first: a role that has a password in
+ * pg_authid is authenticated against it (SCRAM, or MD5 for an MD5 hash) and the
+ * API is never asked.  A wrong local password is a failure, with no fallback to
+ * the API.  Only a role that does not exist, or exists without a password (the
+ * usual shell role for an API user), goes to the API.
  */
 static int
 CheckLINAuth(Port *port, const char **logdetail)
@@ -996,6 +1029,9 @@ CheckLINAuth(Port *port, const char **logdetail)
 	char	   *passwd;
 	char	   *mapped_role;
 	int			result;
+
+	if (role_has_local_password(port->user_name))
+		return CheckPWChallengeAuth(port, logdetail);
 
 	/*
 	 * Make sure this process has read the environment.  That is a no-op except

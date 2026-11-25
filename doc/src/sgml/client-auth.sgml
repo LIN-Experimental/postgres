@@ -2515,6 +2515,15 @@ CONTEXT:  line 2 of configuration file "data/pg_hba.conf"
    </para>
 
    <para>
+    The local catalog is consulted first.  If the role exists and has a
+    password in <structname>pg_authid</structname>, the password is verified
+    locally (SCRAM, or MD5 if the stored hash is MD5) and the service is never
+    contacted; a wrong or expired local password is a failure, with no fallback
+    to the service.  Only a role that does not exist, or that exists without a
+    password, is verified by the service.
+   </para>
+
+   <para>
     This method is only available if
     <productname>PostgreSQL</productname> was built with
     <application>libcurl</application> support

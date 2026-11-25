@@ -415,6 +415,22 @@ Usa **`hostssl`, no `host`**, en producción: como `password`, `ldap` o `pam`,
 initdb -D /ruta/datos --auth-local=trust --auth-host=lin
 ```
 
+### Orden de validación: primero local, después LIN
+
+`lin` consulta primero `pg_authid`:
+
+1. Si el rol **existe y tiene contraseña**, se valida **solo en local** (SCRAM,
+   o MD5 si el hash es MD5). La API de LIN no se consulta. Una contraseña
+   incorrecta o caducada falla, sin intentar LIN.
+2. Si el rol **no existe, o existe sin contraseña**, se valida contra la API de
+   LIN.
+
+Por eso `POSTGRES_USER` entra con `POSTGRES_PASSWORD` aunque haya LIN, y los
+roles "cáscara vacía" (`CREATE ROLE alex LOGIN IN ROLE app_users`) siguen yendo a
+LIN. Consecuencia: un rol local con contraseña y el mismo nombre que un usuario
+de LIN lo desplaza, así que solo los administradores deben poder crear roles con
+contraseña.
+
 ### El rol tiene que existir
 
 `lin` verifica la contraseña, pero **no crea roles**, igual que LDAP o PAM. La
@@ -578,7 +594,7 @@ docker exec pg psql -U postgres -c "ALTER SYSTEM SET log_connections = 'all'" \
 |---|---|
 | `src/backend/libpq/auth-lin.c` | Configuración por entorno, llamada HTTP y parseo de la respuesta. |
 | `src/include/libpq/lin.h` | Nombres de las variables, contrato y `USE_LIN_AUTH`. |
-| `src/backend/libpq/auth.c` | `CheckLINAuth()`: pide la contraseña y despacha. |
+| `src/backend/libpq/auth.c` | `CheckLINAuth()`: valida en local si el rol tiene contraseña; si no, pide la contraseña y despacha a la API. |
 | `src/backend/libpq/hba.c` | Reconoce `lin` en `pg_hba.conf`. |
 | `src/include/libpq/hba.h` | `uaLIN` en el enum de métodos. |
 | `src/backend/postmaster/postmaster.c` | Valida el entorno al arrancar. |
